@@ -105,7 +105,7 @@ constexpr const char* KASSE_BODY = R"HTML(
     <input type=text id=amount inputmode=decimal autocomplete=off>
     <div class=buttons>
       <button type=submit class=secondary>Gebühr anzeigen</button>
-      <button type=button onclick="action('pay')">Bezahlen</button>
+      <button type=button id=payBtn>Bezahlen</button>
     </div>
   </form>
   <div id=payMsg class='msg out' hidden></div>
@@ -160,7 +160,7 @@ function renderFee(f){
   if(f.grace) rows.push(['Ausfahrt ohne Nachzahlung noch',f.grace]);
   for(const [k,v] of rows){const tr=document.createElement('tr');const th=document.createElement('th');th.textContent=k;tr.append(th);cell(tr,v);tb.append(tr);}
 }
-async function action(kind){
+async function kasseAction(kind){
   const sec=$('paySec'); const data={plate:$('plate').value};
   if(kind==='pay'){ data.amount=$('amount').value; data.rid=newRid(); }
   busy(sec,true,kind==='pay'?'Zahlung wird verarbeitet …':'Gebühr wird berechnet …');
@@ -173,7 +173,9 @@ async function action(kind){
   }
   loadState();
 }
-$('payForm').onsubmit=e=>{e.preventDefault();action('fee');};
+// Kein onclick-Attribut im Formular: dort würde "action" auf form.action (Text) zeigen.
+$('payForm').addEventListener('submit',e=>{e.preventDefault();kasseAction('fee');});
+$('payBtn').addEventListener('click',()=>kasseAction('pay'));
 loadState(); setInterval(loadState,3000);
 </script>
 )HTML";

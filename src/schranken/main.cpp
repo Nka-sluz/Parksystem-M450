@@ -447,13 +447,13 @@ constexpr const char* PAGE_BODY = R"HTML(
   <h2>Einfahrt</h2>
   <div class=gate><span class=lamp id=entryLamp></span><span id=entryState>Einfahrt zu</span></div>
   <div class=muted id=entryInfo>&nbsp;</div>
-  <form onsubmit="act('entry','entry');return false">
+  <form data-act="entry:entry">
     <label for=entryPlate>Kennzeichen (Kamera)</label>
     <input type=text id=entryPlate autocomplete=off autocapitalize=characters autofocus>
     <div class=buttons>
       <button type=submit>Kennzeichen erfassen</button>
-      <button type=button class=secondary onclick="act('entry','entryManual')">Manuelle Abfertigung</button>
-      <button type=button class=secondary onclick="act('entry','entryPass')">Durchfahrt bestätigen</button>
+      <button type=button class=secondary data-act="entry:entryManual">Manuelle Abfertigung</button>
+      <button type=button class=secondary data-act="entry:entryPass">Durchfahrt bestätigen</button>
     </div>
   </form>
   <div class='msg out' hidden></div>
@@ -462,13 +462,13 @@ constexpr const char* PAGE_BODY = R"HTML(
   <h2>Ausfahrt</h2>
   <div class=gate><span class=lamp id=exitLamp></span><span id=exitState>Ausfahrt zu</span></div>
   <div class=muted id=exitInfo>&nbsp;</div>
-  <form onsubmit="act('exit','exit');return false">
+  <form data-act="exit:exit">
     <label for=exitPlate>Kennzeichen (Kamera) bzw. Ersatz-ID bei manueller Abfertigung</label>
     <input type=text id=exitPlate autocomplete=off autocapitalize=characters>
     <div class=buttons>
       <button type=submit>Kennzeichen erfassen</button>
-      <button type=button class=secondary onclick="act('exit','exitManual')">Manuelle Abfertigung</button>
-      <button type=button class=secondary onclick="act('exit','exitPass')">Durchfahrt bestätigen</button>
+      <button type=button class=secondary data-act="exit:exitManual">Manuelle Abfertigung</button>
+      <button type=button class=secondary data-act="exit:exitPass">Durchfahrt bestätigen</button>
     </div>
   </form>
   <div class='msg out' hidden></div>
@@ -482,7 +482,7 @@ constexpr const char* PAGE_BODY = R"HTML(
     <div class=stat><b id=kasse>–</b><span>Verbindung Pico 2 → Kasse</span></div>
   </div>
   <div id=pending class='msg warn' hidden></div>
-  <div class=buttons><button type=button class=secondary onclick="act('sys','servoTest')">Schranken testen</button></div>
+  <div class=buttons><button type=button class=secondary data-act="sys:servoTest">Schranken testen</button></div>
   <p class=muted>Öffnet und schliesst beide Schranken einmal – zum Prüfen der Servo-Verdrahtung.</p>
   <div class='msg out' hidden></div>
 </section>
@@ -524,6 +524,12 @@ async function refresh(){
   }catch(e){}
   finally{ polling=false; }
 }
+// Ereignisse per addEventListener statt onclick-Attribut: Inline-Handler in
+// einem <form> suchen Namen zuerst im Formular (z. B. form.action).
+document.querySelectorAll('[data-act]').forEach(el=>{
+  const [target,action]=el.dataset.act.split(':');
+  el.addEventListener(el.tagName==='FORM'?'submit':'click',e=>{e.preventDefault();act(target,action);});
+});
 refresh(); setInterval(refresh,1000);
 </script>
 )HTML";
