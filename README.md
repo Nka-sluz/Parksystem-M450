@@ -24,6 +24,16 @@ in **Arduino (C++17)** mit PlatformIO.
   Freigabe. Ist Pico 1 nicht erreichbar, bleiben die Schranken zu
   (**Fail-safe**). Das Protokoll ist in
   [docs/HTTP-Protokoll.md](docs/HTTP-Protokoll.md) beschrieben.
+- **Robust bei wackeligem WLAN:** Pico 2 wiederholt fehlgeschlagene Anfragen
+  an die Kasse (bis zu 3 Versuche), die Weboberflächen ebenso. Jede Aktion
+  trägt eine Request-ID; eine Wiederholung bekommt die gespeicherte Antwort,
+  statt die Aktion doppelt auszuführen (keine doppelte Registrierung oder
+  Zahlung). Jede Antwort schliesst die Verbindung sofort, weil der WebServer
+  des Pico sonst bis zu 5 s auf den Browser wartet und andere Anfragen blockiert.
+- **Rückmeldung in der Oberfläche:** Während einer Aktion sind die Buttons
+  gesperrt und eine Ladeanzeige läuft. Beide Seiten aktualisieren sich
+  automatisch (Kamera-Simulation jede Sekunde, Kasse alle 3 s) und zeigen
+  den Verbindungsstatus; zusätzlich gibt es einen Button „Aktualisieren".
 - **Gemeinsame Logik** (Kennzeichenprüfung, Tarif, Register, Protokoll,
   Protokollformat) liegt hardwareunabhängig in `lib/ParkCore/`. Die Zeit wird
   als Parameter übergeben (`millis()` auf dem Pico).
@@ -59,6 +69,21 @@ VBUS und GND am besten auf die Plus/Minus-Schiene des Breadboards legen und
 beide Servos dort anschliessen. Pins und Winkel (`SERVO_OPEN_DEG`,
 `SERVO_CLOSED_DEG`) sind in `include/Config.h` einstellbar.
 Pico 1 braucht nur USB-Strom.
+
+**Servo prüfen:** Beim Einschalten öffnet und schliesst Pico 2 beide
+Schranken einmal (Selbsttest). Auf der Kamera-Simulation kann der Test unter
+„Status" jederzeit mit **„Schranken testen"** wiederholt werden. Bewegt sich
+ein Servo dabei nicht:
+
+| Prüfen | Hinweis |
+|---|---|
+| Signal am richtigen Pin? | GP8 ist **Pin 11** (linke Seite, 11. Pin von oben bei USB-Buchse oben), GP9 ist Pin 12. „GP8" ≠ „Pin 8" (Pin 8 ist GND) |
+| Am richtigen Pico? | Die Servos gehören an **Pico 2 (Schranken)** |
+| Strom? | Rot an **VBUS (Pin 40)**, nicht an 3V3. VBUS liefert nur 5 V, wenn der Pico per USB versorgt wird |
+| Masse? | Braun an einen **GND**-Pin desselben Pico |
+| Stecker richtig herum? | Reihenfolge am Servo-Stecker: orange – rot – braun |
+| Breadboard? | Pico-Pin und Kabel müssen in derselben 5er-Reihe stecken; die Plus/Minus-Schienen sind bei manchen Breadboards in der Mitte unterbrochen |
+| Firmware? | Serieller Monitor (115200 Baud) zeigt beim Start `Servo Einfahrt GP8: bereit`; steht dort `FEHLER` oder zeigt die Seite „Servo-Ausgang nicht bereit", liegt es an der Software |
 
 ## Build- und Bedienanleitung
 
@@ -164,7 +189,7 @@ Parksystem"; Testfälle: „Testkonzept Parksystem" (TC-01 bis TC-41).
 | **US6** Belegung anzeigen | ✅ | Kapazität/belegt/frei auf der Kasse, freie Plätze auch auf der Kamera-Simulation; Zähler wird aus dem Register berechnet (nie < 0, nie > Kapazität) |
 | **US7** Protokoll für den Besitzer | ✅ | Ringpuffer mit fortlaufender Nummer; zeitlich sortiert; Überschreiben wird angezeigt (fehlende Nummern + Hinweis); CSV mit `;`-Trennung, 7 Felder pro Zeile |
 | **US8** Manuelle Abfertigung | ✅ | Button „Manuelle Abfertigung" vergibt `MANUAL-<n>`; bei vollem Parkhaus abgelehnt; Ausfahrt mit Ersatz-ID wie US3–US5; im Protokoll Spalte `manuell = ja` |
-| Fail-safe | ✅ | Ohne Antwort der Kasse (Timeout 1,5 s / WLAN weg) bleibt jede Schranke zu |
+| Fail-safe | ✅ | Ohne gültige Antwort der Kasse (3 Versuche à 1 s / WLAN weg) bleibt jede Schranke zu |
 | Reaktionszeit ≤ 2 s | ✅ | Eine HTTP-Anfrage im lokalen WLAN, danach sofort Servo/LED |
 | Datenkonsistenz | ✅ | Jedes Kennzeichen max. einmal im Register; doppelte Bestätigung wird auf Pico 2 und Pico 1 abgewiesen; höchstens `CAPACITY` Fahrzeuge „im Parkhaus" |
 | Robuste Eingaben | ✅ | Eingaben werden gekürzt, validiert und HTML-escaped; Protokoll enthält nur bereinigten Text |
@@ -176,7 +201,7 @@ Parksystem"; Testfälle: „Testkonzept Parksystem" (TC-01 bis TC-41).
 - **Automatisiert (Komponententest):** `test/host/parkcore_test.cpp` prüft
   die Logik aus `lib/ParkCore` auf dem PC anhand derselben Szenarien
   (Kennzeichen, Tarif, Register, Bezahlung, Ausfahrt, Protokoll, manuelle
-  Abfertigung), aktuell 242 Prüfungen ohne Fehler. Anleitung:
+  Abfertigung), aktuell 254 Prüfungen ohne Fehler. Anleitung:
   [test/host/README.md](test/host/README.md).
 
 ## Projektstruktur
@@ -185,6 +210,7 @@ Parksystem"; Testfälle: „Testkonzept Parksystem" (TC-01 bis TC-41).
 include/Config.h          zentrale Konstanten (Tarif, Kapazität, Timeouts, WLAN, Pins)
 include/WebOut.h          HTML-Ausgabe aus festem Puffer
 include/WebStyle.h        gemeinsames CSS
+include/WebScript.h       gemeinsames JavaScript (Wiederholungen, Ladeanzeige)
 lib/ParkCore/src/         hardwareunabhängige Logik
   Plate.*                 Kennzeichenprüfung
   Tariff.*                Gebührenberechnung
@@ -192,6 +218,7 @@ lib/ParkCore/src/         hardwareunabhängige Logik
   EventLog.*              Protokoll (Ringpuffer, CSV)
   Protocol.*              HTTP-Protokoll Pico 2 ↔ Pico 1
   Format.*                Beträge/Zeiten formatieren
+  ReplayCache.h           Antworten zu Request-IDs (Wiederholungen ohne Doppelbuchung)
 src/kasse/main.cpp        Firmware Pico 1
 src/schranken/            Firmware Pico 2
 docs/HTTP-Protokoll.md    Schnittstellenbeschreibung

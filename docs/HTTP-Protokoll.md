@@ -16,12 +16,27 @@ Die Konstanten (Pfade, Feldnamen) stehen in `lib/ParkCore/src/Protocol.h`.
 | Antwort | `text/plain; charset=utf-8`, ein Feld pro Zeile: `key=value` |
 | Fachliche Ablehnungen | HTTP **200** mit `result=DENIED` bzw. `result=ERROR` und `reason=…` |
 | Formale Fehler | HTTP **400** (`result=ERROR`, `reason=MISSING_PLATE`), unbekannter Pfad **404** |
-| Timeout | Pico 2 wartet max. `KASSE_HTTP_TIMEOUT_MS` = 1500 ms |
+| Timeout / Wiederholung | pro Versuch `KASSE_HTTP_TIMEOUT_MS` = 1000 ms, bis zu `KASSE_HTTP_ATTEMPTS` = 3 Versuche im Abstand von 150 ms (`/api/status`: 1 Versuch) |
+| Request-ID | Parameter `rid` bei allen `POST`-Anfragen, z. B. `rid=p2-1a2b3c4d-17` |
+| Verbindung | Jede Antwort schliesst die TCP-Verbindung sofort (`Connection: close`) |
 | Beträge | ganzzahlig in **Rappen** (`due=350` = CHF 3.50) |
 
-**Fail-safe:** Kommt keine Antwort mit HTTP 200 (WLAN getrennt, Timeout, Pico 1
-aus), behandelt Pico 2 das wie eine Ablehnung: Die Schranke bleibt zu und die
-Kamera-Simulation zeigt „Keine Verbindung zur Kasse".
+**Wiederholungen ohne Doppelbuchung:** Geht eine Antwort verloren, wiederholt
+Pico 2 die Anfrage mit **derselben** `rid`. Pico 1 merkt sich die Antworten
+der letzten 8 Request-IDs und sendet bei einer bekannten `rid` die
+gespeicherte Antwort erneut, ohne die Aktion nochmals auszuführen. Eine
+wiederholte Einfahrt liefert also wieder `GRANTED` (nicht `DUPLICATE`), und
+eine Ablehnung wird nur einmal protokolliert.
+
+**Fail-safe:** Kommt nach allen Versuchen keine gültige Antwort (WLAN
+getrennt, Timeout, Pico 1 aus), behandelt Pico 2 das wie eine Ablehnung: Die
+Schranke bleibt zu und die Kamera-Simulation zeigt „Keine Verbindung zur
+Kasse". Eine Antwort gilt nur als gültig, wenn sie das Feld `result` enthält.
+
+**Warum die Verbindung sofort geschlossen wird:** Der WebServer des Pico
+bedient nur eine Verbindung gleichzeitig und würde nach jeder Antwort bis zu
+5 s warten, bis der Browser die Verbindung schliesst. In dieser Zeit wären
+alle anderen Anfragen blockiert, auch die von Pico 2.
 
 ### Reason-Tokens
 
@@ -43,6 +58,7 @@ Kamera-Simulation zeigt „Keine Verbindung zur Kasse".
 |---|---|---|
 | `plate` | ja* | erfasstes Kennzeichen (Rohtext) |
 | `manual` | – | `1` = manuelle Abfertigung; dann wird `plate` ignoriert und eine Ersatz-ID `MANUAL-<n>` vergeben |
+| `rid` | empfohlen | Request-ID (gilt für alle `POST`-Endpunkte) |
 
 \* entweder `plate` oder `manual=1`
 
@@ -142,7 +158,15 @@ Bediener (Kamera-Sim.)       Pico 2 Schranken              Pico 1 Kasse
 | Pico | Pfad | Inhalt |
 |---|---|---|
 | 1 | `/` | Kasse/Zahlautomat: Gebühr anzeigen, bezahlen, Belegung, Register |
+| 1 | `GET /ui/state` | JSON: Belegung, Umsatz, Tarif, Fahrzeugregister (Seite fragt alle 3 s ab) |
+| 1 | `POST /ui/fee` | JSON: Gebühr zu `plate` |
+| 1 | `POST /ui/pay` | JSON: Bezahlen (`plate`, optional `amount`, `rid` gegen Doppelzahlung bei Wiederholung) |
 | 1 | `/log` | Protokoll als Tabelle und CSV |
 | 1 | `/log.csv` | Protokoll als CSV-Datei (Header `X-Log-Overwritten` = Anzahl überschriebener Einträge) |
-| 2 | `/` | Kamera-Simulation: Einfahrt, Ausfahrt, manuelle Abfertigung, Durchfahrt bestätigen |
-| 2 | `/state` | JSON-Zustand beider Schranken (wird von der Seite jede Sekunde abgefragt) |
+| 2 | `/` | Kamera-Simulation: Einfahrt, Ausfahrt, manuelle Abfertigung, Durchfahrt bestätigen, Schranken-Test |
+| 2 | `POST /api/action` | JSON: Aktion `action` = `entry`, `entryManual`, `entryPass`, `exit`, `exitManual`, `exitPass` oder `servoTest`, dazu `plate` und `rid` |
+| 2 | `GET /state` | JSON-Zustand beider Schranken (Seite fragt jede Sekunde ab) |
+
+Die Weboberflächen senden Aktionen im Hintergrund (`fetch`) mit Timeout und
+bis zu 3 Versuchen. Auch hier trägt jede Aktion eine `rid`, die bei
+Wiederholungen gleich bleibt, damit nichts doppelt ausgeführt wird.

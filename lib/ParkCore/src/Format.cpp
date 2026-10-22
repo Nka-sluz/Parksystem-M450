@@ -54,4 +54,27 @@ bool parseMoney(const char* text, cfg::Money& out) {
     return true;
 }
 
+void jsonEscape(const char* in, char* out, size_t outLen) {
+    if (outLen == 0) return;
+    size_t o = 0;
+    for (; in != nullptr && *in != '\0'; ++in) {
+        const unsigned char c = static_cast<unsigned char>(*in);
+        char seq[8];
+        size_t n;
+        if (c == '"' || c == '\\') {
+            seq[0] = '\\';
+            seq[1] = static_cast<char>(c);
+            n = 2;
+        } else if (c < 0x20) {
+            n = static_cast<size_t>(snprintf(seq, sizeof(seq), "\\u%04x", c));
+        } else {
+            seq[0] = static_cast<char>(c);
+            n = 1;
+        }
+        if (o + n >= outLen) break;
+        for (size_t i = 0; i < n; ++i) out[o++] = seq[i];
+    }
+    out[o] = '\0';
+}
+
 }  // namespace park

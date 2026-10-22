@@ -18,4 +18,8 @@ void formatClock(uint32_t ms, char* out, size_t outLen);
 // "12.50" / "12" / "12.5" → 1250. Liefert false bei ungültiger Eingabe.
 bool parseMoney(const char* text, cfg::Money& out);
 
+// Escaped `in` für einen JSON-String (ohne Anführungszeichen). Kürzt bei
+// Platzmangel, ohne eine Escape-Sequenz zu zerschneiden.
+void jsonEscape(const char* in, char* out, size_t outLen);
+
 }  // namespace park

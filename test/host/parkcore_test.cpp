@@ -20,6 +20,7 @@
 #include "ParkingSystem.h"
 #include "Plate.h"
 #include "Protocol.h"
+#include "ReplayCache.h"
 #include "Tariff.h"
 
 static_assert(PARK_TEST_CONFIG == 1, "Tests erwarten die Testkonfiguration");
@@ -375,6 +376,47 @@ void testHelpers() {
     CHECK(park::reasonFromToken(park::reasonToken(Reason::Unpaid)) == Reason::Unpaid);
 }
 
+void testReplay() {
+    puts("Wiederholte Anfragen (Request-ID, ReplayCache)");
+    park::ReplayCache<2, 32> cache;
+    CHECK(cache.find("a") == nullptr);
+    CHECK(cache.find("") == nullptr);
+    cache.store("", "leer");  // leere IDs werden nie gespeichert
+    CHECK(cache.find("") == nullptr);
+    cache.store("a", "result=GRANTED");
+    CHECK(cache.find("a") != nullptr && strcmp(cache.find("a"), "result=GRANTED") == 0);
+    cache.store("b", "B");
+    cache.store("c", "C");  // verdrängt "a" (ältester Eintrag)
+    CHECK(cache.find("a") == nullptr);
+    CHECK(strcmp(cache.find("b"), "B") == 0 && strcmp(cache.find("c"), "C") == 0);
+
+    // Szenario: Antwort der Kasse geht verloren, Pico 2 wiederholt die Einfahrt
+    // mit derselben ID → gleiche Antwort, keine "bereits eingefahren"-Ablehnung.
+    ParkingSystem p;
+    park::ReplayCache<8, 192> api;
+    auto handleEntry = [&](const char* rid, const char* plate, uint32_t t) -> const char* {
+        if (const char* cached = api.find(rid)) return cached;
+        static char body[192];
+        const auto r = p.requestEntry(plate, t);
+        snprintf(body, sizeof(body), "result=%s\nreason=%s\n", r.granted ? "GRANTED" : "DENIED",
+                 park::reasonToken(r.reason));
+        api.store(rid, body);
+        return api.find(rid);
+    };
+    char first[192];
+    snprintf(first, sizeof(first), "%s", handleEntry("p2-1", "ZH-100001", 0));
+    CHECK(strstr(first, "GRANTED") != nullptr);
+    CHECK(strcmp(handleEntry("p2-1", "ZH-100001", 500), first) == 0);  // Wiederholung
+    CHECK(p.occupied() == 1 && p.log().size() == 1);
+    CHECK(strstr(handleEntry("p2-2", "ZH-100001", 900), "DUPLICATE") != nullptr);  // neue Anfrage
+
+    char esc[64];
+    park::jsonEscape("a\"b\\c\n", esc, sizeof(esc));
+    CHECK(strcmp(esc, "a\\\"b\\\\c\\u000a") == 0);
+    park::jsonEscape("\"\"\"", esc, 6);  // kürzt, ohne eine Sequenz zu zerschneiden
+    CHECK(strcmp(esc, "\\\"\\\"") == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -390,6 +432,7 @@ int main() {
     testUs7();
     testUs8();
     testHelpers();
+    testReplay();
     printf("\n%d Prüfungen, %d Fehler\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

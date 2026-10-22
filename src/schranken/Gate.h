@@ -11,10 +11,18 @@ class Gate {
 public:
     Gate(const char* name, uint8_t servoPin) : name_(name), pin_(servoPin) {}
 
-    void begin() {
-        servo_.attach(pin_, cfg::SERVO_MIN_US, cfg::SERVO_MAX_US);
+    // Liefert false, wenn der Servo-Ausgang nicht eingerichtet werden konnte.
+    bool begin() {
+        servoOk_ = servo_.attach(pin_, cfg::SERVO_MIN_US, cfg::SERVO_MAX_US) >= 0;
         servo_.write(cfg::SERVO_CLOSED_DEG);
+        return servoOk_;
     }
+
+    bool servoOk() const { return servoOk_; }
+    uint8_t pin() const { return pin_; }
+
+    // Nur für den Schranken-Test: Servo bewegen, ohne den Zustand zu ändern.
+    void moveServo(bool open) { servo_.write(open ? cfg::SERVO_OPEN_DEG : cfg::SERVO_CLOSED_DEG); }
 
     void open(const char* id, bool manual, uint32_t nowMs) {
         strncpy(id_, id, sizeof(id_) - 1);
@@ -59,6 +67,7 @@ private:
     const char* name_;
     uint8_t pin_;
     Servo servo_;
+    bool servoOk_ = false;
     bool open_ = false;
     bool manual_ = false;
     uint32_t openedAtMs_ = 0;

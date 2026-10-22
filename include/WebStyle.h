@@ -39,4 +39,14 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
 .lamp.on{background:#2ecc55;box-shadow:0 0 10px #2ecc55}
 .muted{color:var(--muted);font-size:14px}
 pre{overflow-x:auto;font-size:13px;background:var(--bg);padding:10px;border-radius:8px}
+button:disabled,input:disabled{opacity:.55;cursor:progress}
+.msg.busy{background:var(--bg);color:var(--muted);display:flex;align-items:center;gap:10px}
+.spin{width:16px;height:16px;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite;flex:none}
+@keyframes spin{to{transform:rotate(360deg)}}
+.pill{font-size:13px;padding:2px 10px;border-radius:999px;font-weight:600}
+.pill.ok{background:var(--okbg);color:var(--ok)}
+.pill.err{background:var(--errbg);color:var(--err)}
+.spacer{flex:1}
+.head-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.head-actions button{padding:6px 12px;font-size:14px}
 )CSS";

@@ -22,6 +22,9 @@ constexpr const char* PATH_STATUS = "/api/status";             // GET
 // Parameter
 constexpr const char* P_PLATE = "plate";
 constexpr const char* P_MANUAL = "manual";
+// Request-ID: Wiederholungen derselben Anfrage tragen dieselbe ID und
+// bekommen die gespeicherte Antwort (siehe ReplayCache.h).
+constexpr const char* P_RID = "rid";
 
 // Antwortfelder
 constexpr const char* F_RESULT = "result";    // GRANTED | DENIED | OPEN | OK | ERROR

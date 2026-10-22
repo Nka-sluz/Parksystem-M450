@@ -6,6 +6,7 @@
 //  - Weboberfläche Kasse/Zahlautomat:  http://192.168.42.1/
 //  - Protokoll:                        http://192.168.42.1/log  (CSV: /log.csv)
 //  - HTTP-API für Pico 2 (Schranken):  /api/...  (siehe docs/HTTP-Protokoll.md)
+//  - JSON für die eigene Weboberfläche: /ui/...
 // =============================================================================
 
 #include <Arduino.h>
@@ -17,7 +18,9 @@
 #include "Format.h"
 #include "ParkingSystem.h"
 #include "Protocol.h"
+#include "ReplayCache.h"
 #include "WebOut.h"
+#include "WebScript.h"
 #include "WebStyle.h"
 
 namespace {
@@ -25,35 +28,51 @@ namespace {
 WebServer server(cfg::HTTP_PORT);
 park::ParkingSystem parking;
 
+// Antworten auf wiederholte Anfragen (gleiche Request-ID) erneut ausliefern.
+park::ReplayCache<8, 192> apiReplay;  // Pico 2 → Kasse
+park::ReplayCache<4, 640> payReplay;  // Browser → Bezahlen
+
 uint32_t nowMs() { return millis(); }
 
 IPAddress toIp(const uint8_t (&a)[4]) { return IPAddress(a[0], a[1], a[2], a[3]); }
 
 // ----------------------------------------------------------------------------
-//  Hilfsfunktionen für die Anzeige
+//  Hilfsfunktionen
 // ----------------------------------------------------------------------------
+
+struct Text16 {
+    char s[16];
+};
+
+Text16 money(cfg::Money m) {
+    Text16 t;
+    park::formatMoney(m, t.s, sizeof(t.s));
+    return t;
+}
+
+Text16 hms(uint32_t ms) {
+    Text16 t;
+    park::formatClock(ms, t.s, sizeof(t.s));
+    return t;
+}
 
 const char* vehicleStatus(const park::Vehicle& v, uint32_t now) {
     if (v.state == park::VehicleState::Exited) return "ausgefahren";
-    const cfg::Money due = parking.dueFor(v, now);
     if (!v.hasPaid) return "im Parkhaus, unbezahlt";
-    if (due > 0) return "im Parkhaus, Nachzahlung fällig";
+    if (parking.dueFor(v, now) > 0) return "im Parkhaus, Nachzahlung fällig";
     return "im Parkhaus, bezahlt";
 }
 
-void printMoney(WebOut& out, cfg::Money m) {
-    char buf[16];
-    park::formatMoney(m, buf, sizeof(buf));
-    out.raw(buf);
+void tariffText(char* out, size_t len) {
+    const park::Tariff& t = parking.tariff();
+    snprintf(out, len,
+             "Tarif: CHF %s pro angefangene %s (hh:mm:ss) · Freigrenze %s · Tageshöchstsatz CHF %s · "
+             "Karenzzeit nach Bezahlung %s",
+             money(t.pricePerUnit).s, hms(t.unitMs).s, hms(t.freeMs).s, money(t.dailyMax).s,
+             hms(cfg::PAYMENT_GRACE_MS).s);
 }
 
-void printClock(WebOut& out, uint32_t ms) {
-    char buf[16];
-    park::formatClock(ms, buf, sizeof(buf));
-    out.raw(buf);
-}
-
-void pageHeader(WebOut& out, const char* title) {
+void pageStart(WebOut& out, const char* title, const char* refreshAction) {
     out.begin(200, "text/html; charset=utf-8");
     out.raw("<!doctype html><html lang=de><head><meta charset=utf-8>"
             "<meta name=viewport content='width=device-width,initial-scale=1'><title>");
@@ -63,199 +82,225 @@ void pageHeader(WebOut& out, const char* title) {
     out.raw("</h1><a href='/'>Kasse</a><a href='/log'>Protokoll</a>");
     out.printf("<a href='http://%u.%u.%u.%u/'>Kamera-Simulation (Pico 2)</a>", cfg::SCHRANKEN_IP[0],
                cfg::SCHRANKEN_IP[1], cfg::SCHRANKEN_IP[2], cfg::SCHRANKEN_IP[3]);
-    out.raw("<span class=muted>Zeit seit Start: ");
-    printClock(out, nowMs());
-    out.raw("</span></header><main>");
+    out.raw("<span class=spacer></span><div class=head-actions>"
+            "<span class=muted>Zeit seit Start: <span id=uptime>");
+    out.raw(hms(nowMs()).s);
+    out.raw("</span></span><span id=link class='pill ok'>verbunden</span>");
+    out.printf("<button class=secondary onclick=\"%s\">Aktualisieren</button>", refreshAction);
+    out.raw("</div></header><main>");
 }
 
-void pageFooter(WebOut& out) {
-    out.raw("</main></body></html>");
-    out.end();
+// ----------------------------------------------------------------------------
+//  Weboberfläche Kasse / Zahlautomat
+// ----------------------------------------------------------------------------
+
+constexpr const char* KASSE_BODY = R"HTML(
+<div class=grid>
+<section id=paySec>
+  <h2>Parkgebühr anzeigen &amp; bezahlen</h2>
+  <form id=payForm>
+    <label for=plate>Kennzeichen oder Ersatz-ID (MANUAL-…)</label>
+    <input type=text id=plate autocomplete=off autocapitalize=characters autofocus>
+    <label for=amount>Eingeworfener Betrag CHF (leer = passend bezahlen)</label>
+    <input type=text id=amount inputmode=decimal autocomplete=off>
+    <div class=buttons>
+      <button type=submit class=secondary>Gebühr anzeigen</button>
+      <button type=button onclick="action('pay')">Bezahlen</button>
+    </div>
+  </form>
+  <div id=payMsg class='msg out' hidden></div>
+  <div id=details class=table hidden><table><tbody id=detailRows></tbody></table></div>
+  <p class=muted id=tariff></p>
+</section>
+<section>
+  <h2>Belegung</h2>
+  <div class=stats>
+    <div class=stat><b id=cap>–</b><span>Kapazität</span></div>
+    <div class=stat><b id=occ>–</b><span>belegt</span></div>
+    <div class=stat><b id=free>–</b><span>frei</span></div>
+    <div class=stat><b id=rev>–</b><span>Umsatz CHF</span></div>
+  </div>
+  <div id=full class='msg warn' hidden>Parkhaus voll</div>
+</section>
+</div>
+<section>
+  <h2>Fahrzeugregister</h2>
+  <p class=muted>Wird alle 3 s aktualisiert · <span id=updated></span> · Zeile anklicken übernimmt das Kennzeichen</p>
+  <div class=table><table>
+    <thead><tr><th>Kennzeichen</th><th>Einfahrt</th><th>Parkdauer</th><th>Status</th><th class=num>bezahlt CHF</th><th class=num>offen CHF</th></tr></thead>
+    <tbody id=reg><tr><td colspan=6 class=muted>wird geladen …</td></tr></tbody>
+  </table></div>
+</section>
+<script>
+function cell(tr,text,cls){const td=document.createElement('td');td.textContent=text;if(cls)td.className=cls;tr.append(td);}
+function renderState(s){
+  $('uptime').textContent=s.uptime;
+  $('cap').textContent=s.capacity; $('occ').textContent=s.occupied; $('free').textContent=s.free;
+  $('rev').textContent=s.revenue; $('full').hidden=s.free>0; $('tariff').textContent=s.tariff;
+  const tb=$('reg'); tb.replaceChildren();
+  if(!s.vehicles.length){const tr=document.createElement('tr');cell(tr,'Register leer','muted');tr.firstChild.colSpan=6;tb.append(tr);}
+  for(const v of s.vehicles){
+    const tr=document.createElement('tr'); tr.style.cursor='pointer';
+    cell(tr,v.id+(v.manual?' (manuell)':'')); cell(tr,v.entry); cell(tr,v.duration); cell(tr,v.status);
+    cell(tr,v.paid,'num'); cell(tr,v.due,'num');
+    tr.onclick=()=>{$('plate').value=v.id;$('plate').focus();}; tb.append(tr);
+  }
+  $('updated').textContent='zuletzt '+new Date().toLocaleTimeString();
+}
+let loading=false;
+async function loadState(){
+  if(loading) return; loading=true;
+  try{ renderState(await req('/ui/state',{},1,5000)); }catch(e){}
+  finally{ loading=false; }
+}
+function renderFee(f){
+  const box=$('details'), tb=$('detailRows'); tb.replaceChildren(); box.hidden=!f; if(!f) return;
+  const rows=[['Kennzeichen',f.id],['Parkdauer',f.duration],['Gebühr gesamt','CHF '+f.fee],
+              ['bereits bezahlt','CHF '+f.paid],['offener Betrag','CHF '+f.due]];
+  if(f.grace) rows.push(['Ausfahrt ohne Nachzahlung noch',f.grace]);
+  for(const [k,v] of rows){const tr=document.createElement('tr');const th=document.createElement('th');th.textContent=k;tr.append(th);cell(tr,v);tb.append(tr);}
+}
+async function action(kind){
+  const sec=$('paySec'); const data={plate:$('plate').value};
+  if(kind==='pay'){ data.amount=$('amount').value; data.rid=newRid(); }
+  busy(sec,true,kind==='pay'?'Zahlung wird verarbeitet …':'Gebühr wird berechnet …');
+  try{
+    const r=await post('/ui/'+kind,data);
+    busy(sec,false); show($('payMsg'),r.cls,r.msg); renderFee(r.fee);
+    if(kind==='pay'&&r.ok) $('amount').value='';
+  }catch(e){
+    busy(sec,false); show($('payMsg'),'err','Keine Antwort von der Kasse – bitte erneut versuchen'); renderFee(null);
+  }
+  loadState();
+}
+$('payForm').onsubmit=e=>{e.preventDefault();action('fee');};
+loadState(); setInterval(loadState,3000);
+</script>
+)HTML";
+
+void handleRoot() {
+    WebOut out(server);
+    pageStart(out, "Parkhaus – Kasse / Zahlautomat", "loadState()");
+    out.raw("<script>").raw(WEB_SCRIPT_COMMON).raw("</script>");
+    out.raw(KASSE_BODY).raw("</main></body></html>");
 }
 
-void occupancySection(WebOut& out) {
-    out.raw("<section><h2>Belegung</h2><div class=stats>");
-    out.printf("<div class=stat><b>%u</b><span>Kapazität</span></div>", parking.capacity());
-    out.printf("<div class=stat><b>%u</b><span>belegt</span></div>", parking.occupied());
-    out.printf("<div class=stat><b id=free>%u</b><span>frei</span></div>", parking.freeSpaces());
-    out.raw("<div class=stat><b>");
-    printMoney(out, parking.revenue());
-    out.raw("</b><span>Umsatz CHF</span></div></div>");
-    if (parking.freeSpaces() == 0) out.raw("<div class='msg warn'>Parkhaus voll</div>");
-    out.raw("</section>");
-}
-
-void registerSection(WebOut& out) {
+void handleUiState() {
     const uint32_t now = nowMs();
-    out.raw("<section><h2>Fahrzeugregister</h2><div class=table><table><tr><th>Kennzeichen</th>"
-            "<th>Einfahrt</th><th>Parkdauer</th><th>Status</th><th class=num>bezahlt CHF</th>"
-            "<th class=num>offen CHF</th></tr>");
-    bool any = false;
+    char tariff[200];
+    tariffText(tariff, sizeof(tariff));
+
+    WebOut out(server);
+    out.begin(200, "application/json");
+    out.raw("{").field("uptime", hms(now).s, true);
+    out.printf(",\"capacity\":%u,\"occupied\":%u,\"free\":%u", parking.capacity(), parking.occupied(),
+               parking.freeSpaces());
+    out.field("revenue", money(parking.revenue()).s).field("tariff", tariff);
+    out.raw(",\"vehicles\":[");
+    bool first = true;
     // Zuerst Fahrzeuge im Parkhaus, danach ausgefahrene.
     for (int pass = 0; pass < 2; ++pass) {
         const auto wanted = pass == 0 ? park::VehicleState::Inside : park::VehicleState::Exited;
         for (size_t i = 0; i < parking.registerSize(); ++i) {
             const park::Vehicle& v = parking.vehicleAt(i);
             if (!v.used || v.state != wanted) continue;
-            any = true;
-            out.raw("<tr><td>").text(v.id).raw(v.manual ? " <span class=muted>(manuell)</span>" : "");
-            out.raw("</td><td>");
-            printClock(out, v.entryMs);
-            out.raw("</td><td>");
-            printClock(out, (v.state == park::VehicleState::Inside ? now : v.exitMs) - v.entryMs);
-            out.raw("</td><td>").raw(vehicleStatus(v, now)).raw("</td><td class=num>");
-            printMoney(out, v.paidTotal);
-            out.raw("</td><td class=num>");
-            printMoney(out, parking.dueFor(v, now));
-            out.raw("</td></tr>");
+            const uint32_t end = v.state == park::VehicleState::Inside ? now : v.exitMs;
+            out.raw(first ? "{" : ",{");
+            first = false;
+            out.field("id", v.id, true);
+            out.printf(",\"manual\":%s", v.manual ? "true" : "false");
+            out.field("entry", hms(v.entryMs).s).field("duration", hms(end - v.entryMs).s);
+            out.field("status", vehicleStatus(v, now)).field("paid", money(v.paidTotal).s);
+            out.field("due", money(parking.dueFor(v, now)).s);
+            out.raw("}");
         }
     }
-    if (!any) out.raw("<tr><td colspan=6 class=muted>Register leer</td></tr>");
-    out.raw("</table></div></section>");
+    out.raw("]}");
 }
 
-// Ergebnis einer Gebührenabfrage oder Zahlung.
-struct Notice {
-    const char* cls = nullptr;  // "ok" | "err" | "warn"
-    char text[160] = "";
-};
-
-void feeDetails(WebOut& out, const park::FeeResult& fee) {
-    out.raw("<div class=table><table>");
-    out.raw("<tr><th>Kennzeichen</th><td>").text(fee.id).raw("</td></tr>");
-    out.raw("<tr><th>Parkdauer</th><td>");
-    printClock(out, fee.durationMs);
-    out.raw("</td></tr><tr><th>Gebühr gesamt</th><td>CHF ");
-    printMoney(out, fee.fee);
-    out.raw("</td></tr><tr><th>bereits bezahlt</th><td>CHF ");
-    printMoney(out, fee.paid);
-    out.raw("</td></tr><tr><th>offener Betrag</th><td><b>CHF ");
-    printMoney(out, fee.due);
-    out.raw("</b></td></tr>");
-    if (fee.inGrace) {
-        out.raw("<tr><th>Ausfahrt ohne Nachzahlung bis</th><td>noch ");
-        printClock(out, fee.graceLeftMs);
-        out.raw("</td></tr>");
+// Baut die JSON-Antwort für Gebührenabfrage und Zahlung.
+void feeJson(char* out, size_t len, bool ok, const char* cls, const char* msg,
+             const park::FeeResult* fee) {
+    char m[200];
+    park::jsonEscape(msg, m, sizeof(m));
+    int n = snprintf(out, len, "{\"ok\":%s,\"cls\":\"%s\",\"msg\":\"%s\",\"fee\":", ok ? "true" : "false",
+                     cls, m);
+    if (n < 0 || static_cast<size_t>(n) >= len) return;
+    if (fee == nullptr || !fee->ok) {
+        snprintf(out + n, len - n, "null}");
+        return;
     }
-    out.raw("</table></div>");
+    snprintf(out + n, len - n,
+             "{\"id\":\"%s\",\"duration\":\"%s\",\"fee\":\"%s\",\"paid\":\"%s\",\"due\":\"%s\","
+             "\"grace\":\"%s\"}}",
+             fee->id, hms(fee->durationMs).s, money(fee->fee).s, money(fee->paid).s,
+             money(fee->due).s, fee->inGrace ? hms(fee->graceLeftMs).s : "");
 }
 
-void tariffInfo(WebOut& out) {
-    const park::Tariff& t = parking.tariff();
-    out.raw("<p class=muted>Tarif: CHF ");
-    printMoney(out, t.pricePerUnit);
-    out.raw(" pro angefangene ");
-    printClock(out, t.unitMs);
-    out.raw(" (hh:mm:ss) · Freigrenze ");
-    printClock(out, t.freeMs);
-    out.raw(" · Tageshöchstsatz CHF ");
-    printMoney(out, t.dailyMax);
-    out.raw(" · Karenzzeit nach Bezahlung ");
-    printClock(out, cfg::PAYMENT_GRACE_MS);
-    out.raw("</p>");
-}
+void handleUiFee() {
+    char plate[48];
+    readArg(server, "plate", plate, sizeof(plate));
+    const park::FeeResult fee = parking.queryFee(plate, nowMs());
 
-void renderKasse(const char* plate, const char* amount, const Notice& notice,
-                 const park::FeeResult* fee) {
-    WebOut out(server);
-    pageHeader(out, "Parkhaus – Kasse / Zahlautomat");
-
-    out.raw("<div class=grid><section><h2>Parkgebühr anzeigen &amp; bezahlen</h2>"
-            "<form method=post action='/kasse'>"
-            "<label for=plate>Kennzeichen oder Ersatz-ID (MANUAL-…)</label>"
-            "<input type=text id=plate name=plate autocomplete=off autocapitalize=characters value='");
-    out.text(plate);
-    out.raw("'><label for=amount>Eingeworfener Betrag CHF (leer = passend bezahlen)</label>"
-            "<input type=text id=amount name=amount inputmode=decimal autocomplete=off value='");
-    out.text(amount);
-    out.raw("'><div class=buttons><button name=action value=fee class=secondary>Gebühr anzeigen</button>"
-            "<button name=action value=pay>Bezahlen</button></div></form>");
-
-    if (notice.cls != nullptr) {
-        out.printf("<div class='msg %s'>", notice.cls);
-        out.text(notice.text);
-        out.raw("</div>");
+    char msg[120];
+    const char* cls;
+    if (!fee.ok) {
+        cls = "err";
+        snprintf(msg, sizeof(msg), "%s", park::reasonMessage(fee.reason));
+    } else if (fee.due == 0) {
+        cls = "ok";
+        snprintf(msg, sizeof(msg), "Offener Betrag: CHF 0.00 – nichts zu bezahlen");
+    } else {
+        cls = "warn";
+        snprintf(msg, sizeof(msg), "Offener Betrag: CHF %s", money(fee.due).s);
     }
-    if (fee != nullptr && fee->ok) feeDetails(out, *fee);
-    tariffInfo(out);
-    out.raw("</section>");
 
-    occupancySection(out);
-    out.raw("</div>");
-    registerSection(out);
-    pageFooter(out);
+    char body[640];
+    feeJson(body, sizeof(body), fee.ok, cls, msg, &fee);
+    sendAndClose(server, 200, "application/json", body);
 }
 
-// ----------------------------------------------------------------------------
-//  Weboberfläche Kasse
-// ----------------------------------------------------------------------------
+void handleUiPay() {
+    char rid[park::ReplayCache<1, 1>::ID_LEN];
+    readArg(server, proto::P_RID, rid, sizeof(rid));
+    if (const char* cached = payReplay.find(rid)) {
+        sendAndClose(server, 200, "application/json", cached);
+        return;
+    }
 
-void handleKasse() {
     char plate[48];
     char amountText[24];
-    char action[8];
     readArg(server, "plate", plate, sizeof(plate));
     readArg(server, "amount", amountText, sizeof(amountText));
-    readArg(server, "action", action, sizeof(action));
-
-    Notice notice;
     const uint32_t now = nowMs();
 
-    if (strcmp(action, "fee") == 0) {
-        const park::FeeResult fee = parking.queryFee(plate, now);
-        if (!fee.ok) {
-            notice.cls = "err";
-            snprintf(notice.text, sizeof(notice.text), "%s", park::reasonMessage(fee.reason));
-        } else if (fee.due == 0) {
-            notice.cls = "ok";
-            snprintf(notice.text, sizeof(notice.text), "Offener Betrag: CHF 0.00 – nichts zu bezahlen");
-        } else {
-            char due[16];
-            park::formatMoney(fee.due, due, sizeof(due));
-            notice.cls = "warn";
-            snprintf(notice.text, sizeof(notice.text), "Offener Betrag: CHF %s", due);
-        }
-        renderKasse(plate, "", notice, &fee);
+    char body[640];
+    cfg::Money tendered = 0;
+    const bool hasTendered = amountText[0] != '\0';
+    if (hasTendered && !park::parseMoney(amountText, tendered)) {
+        feeJson(body, sizeof(body), false, "err", "Betrag ungültig", nullptr);
+        sendAndClose(server, 200, "application/json", body);
         return;
     }
 
-    if (strcmp(action, "pay") == 0) {
-        cfg::Money tendered = 0;
-        const bool hasTendered = amountText[0] != '\0';
-        if (hasTendered && !park::parseMoney(amountText, tendered)) {
-            notice.cls = "err";
-            snprintf(notice.text, sizeof(notice.text), "Betrag ungültig");
-            renderKasse(plate, amountText, notice, nullptr);
-            return;
-        }
-
-        const park::PaymentResult pay = parking.pay(plate, hasTendered, tendered, now);
-        char a[16];
-        char c[16];
-        park::formatMoney(pay.amount, a, sizeof(a));
-        park::formatMoney(pay.change, c, sizeof(c));
-
-        if (pay.ok && pay.reason == park::Reason::NothingDue) {
-            notice.cls = "ok";
-            snprintf(notice.text, sizeof(notice.text), "nichts zu bezahlen – Status: bezahlt");
-        } else if (pay.ok) {
-            notice.cls = "ok";
-            snprintf(notice.text, sizeof(notice.text), "Bezahlt: CHF %s%s%s – Status: bezahlt", a,
-                     pay.change > 0 ? ", Rückgeld CHF " : "", pay.change > 0 ? c : "");
-        } else if (pay.reason == park::Reason::Insufficient) {
-            notice.cls = "err";
-            snprintf(notice.text, sizeof(notice.text), "Betrag nicht ausreichend – offen: CHF %s", a);
-        } else {
-            notice.cls = "err";
-            snprintf(notice.text, sizeof(notice.text), "Zahlung abgelehnt: %s",
-                     park::reasonMessage(pay.reason));
-        }
-        const park::FeeResult fee = parking.queryFee(plate, now);
-        renderKasse(plate, "", notice, pay.ok ? &fee : nullptr);
-        return;
+    const park::PaymentResult pay = parking.pay(plate, hasTendered, tendered, now);
+    char msg[120];
+    const char* cls = pay.ok ? "ok" : "err";
+    if (pay.ok && pay.reason == park::Reason::NothingDue) {
+        snprintf(msg, sizeof(msg), "nichts zu bezahlen – Status: bezahlt");
+    } else if (pay.ok) {
+        snprintf(msg, sizeof(msg), "Bezahlt: CHF %s%s%s – Status: bezahlt", money(pay.amount).s,
+                 pay.change > 0 ? ", Rückgeld CHF " : "", pay.change > 0 ? money(pay.change).s : "");
+    } else if (pay.reason == park::Reason::Insufficient) {
+        snprintf(msg, sizeof(msg), "Betrag nicht ausreichend – offen: CHF %s", money(pay.amount).s);
+    } else {
+        snprintf(msg, sizeof(msg), "Zahlung abgelehnt: %s", park::reasonMessage(pay.reason));
     }
 
-    renderKasse(plate, "", notice, nullptr);
+    const park::FeeResult fee = parking.queryFee(plate, now);
+    feeJson(body, sizeof(body), pay.ok, cls, msg, &fee);
+    payReplay.store(rid, body);
+    sendAndClose(server, 200, "application/json", body);
 }
 
 // ----------------------------------------------------------------------------
@@ -265,11 +310,12 @@ void handleKasse() {
 void handleLog() {
     const park::EventLog& log = parking.log();
     WebOut out(server);
-    pageHeader(out, "Parkhaus – Protokoll");
+    pageStart(out, "Parkhaus – Protokoll", "location.reload()");
     out.raw("<section><h2>Protokoll aller Ein-/Ausfahrten und Zahlungen</h2>");
-    out.printf("<p class=muted>%u von max. %u Einträgen · älteste zuerst · "
+    out.printf("<p class=muted>%u von max. %u Einträgen · älteste zuerst · Stand %s · "
                "<a href='/log.csv'>als CSV herunterladen</a></p>",
-               static_cast<unsigned>(log.size()), static_cast<unsigned>(cfg::LOG_CAPACITY));
+               static_cast<unsigned>(log.size()), static_cast<unsigned>(cfg::LOG_CAPACITY),
+               hms(nowMs()).s);
     if (log.overwrittenCount() > 0) {
         out.printf("<div class='msg warn'>Obergrenze erreicht: %lu ältere Einträge wurden "
                    "überschrieben (Nr. 1–%lu fehlen).</div>",
@@ -280,11 +326,10 @@ void handleLog() {
             "<th>Kennzeichen</th><th class=num>Betrag CHF</th><th>Grund</th><th>manuell</th></tr>");
     for (size_t i = 0; i < log.size(); ++i) {
         const park::LogEntry& e = log.at(i);
-        out.printf("<tr><td class=num>%lu</td><td>", static_cast<unsigned long>(e.seq));
-        printClock(out, e.timeMs);
-        out.raw("</td><td>").raw(park::eventTypeText(e.type)).raw("</td><td>").text(e.id);
-        out.raw("</td><td class=num>");
-        if (e.hasAmount) printMoney(out, e.amount);
+        out.printf("<tr><td class=num>%lu</td><td>%s</td><td>", static_cast<unsigned long>(e.seq),
+                   hms(e.timeMs).s);
+        out.raw(park::eventTypeText(e.type)).raw("</td><td>").text(e.id).raw("</td><td class=num>");
+        if (e.hasAmount) out.raw(money(e.amount).s);
         out.raw("</td><td>").raw(park::reasonText(e.reason)).raw("</td><td>");
         out.raw(e.manual ? "ja" : "nein").raw("</td></tr>");
     }
@@ -298,8 +343,7 @@ void handleLog() {
         park::EventLog::formatCsv(log.at(i), line, sizeof(line));
         out.text(line).raw("\n");
     }
-    out.raw("</pre></section>");
-    pageFooter(out);
+    out.raw("</pre></section></main></body></html>");
 }
 
 void handleLogCsv() {
@@ -317,18 +361,35 @@ void handleLogCsv() {
         park::EventLog::formatCsv(log.at(i), line, sizeof(line));
         out.raw(line).raw("\n");
     }
-    out.end();
 }
 
 // ----------------------------------------------------------------------------
 //  API für Pico 2 (Schranken)
 // ----------------------------------------------------------------------------
 
-void sendApi(int code, const char* body) { server.send(code, "text/plain; charset=utf-8", body); }
+void sendApi(int code, const char* body) { sendAndClose(server, code, "text/plain; charset=utf-8", body); }
 
 bool isManualRequest() { return server.hasArg(proto::P_MANUAL) && server.arg(proto::P_MANUAL) == "1"; }
 
+// Wiederholte Anfrage? Dann gespeicherte Antwort senden und true liefern.
+bool replayIfKnown(char* rid, size_t ridLen) {
+    readArg(server, proto::P_RID, rid, ridLen);
+    if (const char* cached = apiReplay.find(rid)) {
+        sendApi(200, cached);
+        return true;
+    }
+    return false;
+}
+
+void answerApi(const char* rid, const char* body) {
+    apiReplay.store(rid, body);
+    sendApi(200, body);
+}
+
 void handleApiEntry() {
+    char rid[park::ReplayCache<1, 1>::ID_LEN];
+    if (replayIfKnown(rid, sizeof(rid))) return;
+
     const uint32_t now = nowMs();
     park::EntryResult r;
     if (isManualRequest()) {
@@ -346,10 +407,12 @@ void handleApiEntry() {
     snprintf(body, sizeof(body), "%s=%s\n%s=%s\n%s=%s\n%s=%u\n", proto::F_RESULT,
              r.granted ? proto::R_GRANTED : proto::R_DENIED, proto::F_REASON,
              park::reasonToken(r.reason), proto::F_ID, r.id, proto::F_FREE, parking.freeSpaces());
-    sendApi(200, body);
+    answerApi(rid, body);
 }
 
 void handleApiExitCheck() {
+    char rid[park::ReplayCache<1, 1>::ID_LEN];
+    if (replayIfKnown(rid, sizeof(rid))) return;
     if (!server.hasArg(proto::P_PLATE)) {
         sendApi(400, "result=ERROR\nreason=MISSING_PLATE\n");
         return;
@@ -363,10 +426,12 @@ void handleApiExitCheck() {
              r.open ? proto::R_OPEN : proto::R_DENIED, proto::F_REASON, park::reasonToken(r.reason),
              proto::F_ID, r.id, proto::F_DUE, static_cast<long>(r.due), proto::F_FREE,
              parking.freeSpaces());
-    sendApi(200, body);
+    answerApi(rid, body);
 }
 
 void handleApiExitConfirm() {
+    char rid[park::ReplayCache<1, 1>::ID_LEN];
+    if (replayIfKnown(rid, sizeof(rid))) return;
     if (!server.hasArg(proto::P_PLATE)) {
         sendApi(400, "result=ERROR\nreason=MISSING_PLATE\n");
         return;
@@ -379,10 +444,12 @@ void handleApiExitConfirm() {
     snprintf(body, sizeof(body), "%s=%s\n%s=%s\n%s=%u\n", proto::F_RESULT,
              reason == park::Reason::None ? proto::R_OK : proto::R_ERROR, proto::F_REASON,
              park::reasonToken(reason), proto::F_FREE, parking.freeSpaces());
-    sendApi(200, body);
+    answerApi(rid, body);
 }
 
 void handleApiExitAbort() {
+    char rid[park::ReplayCache<1, 1>::ID_LEN];
+    if (replayIfKnown(rid, sizeof(rid))) return;
     if (!server.hasArg(proto::P_PLATE)) {
         sendApi(400, "result=ERROR\nreason=MISSING_PLATE\n");
         return;
@@ -390,7 +457,7 @@ void handleApiExitAbort() {
     char plate[48];
     readArg(server, proto::P_PLATE, plate, sizeof(plate));
     parking.abortExit(plate, isManualRequest(), nowMs());
-    sendApi(200, "result=OK\n");
+    answerApi(rid, "result=OK\n");
 }
 
 void handleApiStatus() {
@@ -401,7 +468,7 @@ void handleApiStatus() {
     sendApi(200, body);
 }
 
-void handleNotFound() { server.send(404, "text/plain; charset=utf-8", "Nicht gefunden\n"); }
+void handleNotFound() { sendAndClose(server, 404, "text/plain; charset=utf-8", "Nicht gefunden\n"); }
 
 }  // namespace
 
@@ -414,8 +481,10 @@ void setup() {
     WiFi.softAPConfig(toIp(cfg::KASSE_IP), toIp(cfg::KASSE_IP), toIp(cfg::NETMASK));
     const bool apOk = WiFi.softAP(cfg::WIFI_SSID, cfg::WIFI_PASSWORD);
 
-    server.on("/", HTTP_GET, handleKasse);
-    server.on("/kasse", handleKasse);
+    server.on("/", HTTP_GET, handleRoot);
+    server.on("/ui/state", HTTP_GET, handleUiState);
+    server.on("/ui/fee", HTTP_POST, handleUiFee);
+    server.on("/ui/pay", HTTP_POST, handleUiPay);
     server.on("/log", HTTP_GET, handleLog);
     server.on("/log.csv", HTTP_GET, handleLogCsv);
     server.on(proto::PATH_ENTRY, HTTP_POST, handleApiEntry);

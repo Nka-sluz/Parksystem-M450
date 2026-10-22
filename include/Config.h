@@ -71,9 +71,13 @@ constexpr uint8_t SCHRANKEN_IP[4] = {192, 168, 42, 2};
 constexpr uint8_t NETMASK[4] = {255, 255, 255, 0};
 constexpr uint16_t HTTP_PORT = 80;
 
-// Pico 2 → Pico 1: maximale Wartezeit auf eine Antwort. Bleibt sie aus,
-// bleibt die Schranke geschlossen (Fail-safe). Muss < 2 s sein (Reaktionszeit).
-constexpr uint16_t KASSE_HTTP_TIMEOUT_MS = 1500;
+// Pico 2 → Pico 1: Wartezeit pro Versuch und Anzahl Versuche. Bleibt jede
+// Antwort aus, bleibt die Schranke geschlossen (Fail-safe). Wiederholungen
+// tragen dieselbe Request-ID, die Kasse führt eine Aktion also nie doppelt aus.
+// Bei funktionierender Verbindung antwortet die Kasse in < 100 ms (Reaktionszeit ≤ 2 s).
+constexpr uint16_t KASSE_HTTP_TIMEOUT_MS = 1000;
+constexpr uint8_t KASSE_HTTP_ATTEMPTS = 3;
+constexpr uint16_t KASSE_HTTP_RETRY_DELAY_MS = 150;
 // Pico 2 fragt die Belegung periodisch ab und zeigt den Verbindungsstatus an.
 constexpr uint32_t STATUS_POLL_INTERVAL_MS = 5000;
 // Pico 2 versucht in diesem Abstand, die WLAN-Verbindung wiederherzustellen.

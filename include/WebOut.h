@@ -1,11 +1,17 @@
 #pragma once
 // Gibt eine HTTP-Antwort stückweise (chunked) aus einem festen Puffer aus,
-// damit HTML-Seiten ohne dynamisch wachsende Strings erzeugt werden können.
+// damit HTML-/JSON-Antworten ohne dynamisch wachsende Strings erzeugt werden.
 
 #include <WebServer.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+
+// Schliesst die Verbindung nach einer Antwort sofort. Der WebServer bedient
+// nur eine Verbindung gleichzeitig und würde sonst bis zu 5 s warten, bis der
+// Browser die Verbindung schliesst – in dieser Zeit wären alle anderen
+// Anfragen (auch die von Pico 2) blockiert.
+inline void closeConnection(WebServer& server) { server.client().stop(500); }
 
 class WebOut {
 public:
@@ -51,11 +57,38 @@ public:
         return *this;
     }
 
+    // JSON-String inkl. Anführungszeichen.
+    WebOut& json(const char* s) {
+        put('"');
+        for (; *s != '\0'; ++s) {
+            const unsigned char c = static_cast<unsigned char>(*s);
+            if (c == '"' || c == '\\') {
+                put('\\');
+                put(static_cast<char>(c));
+            } else if (c < 0x20) {
+                printf("\\u%04x", c);
+            } else {
+                put(static_cast<char>(c));
+            }
+        }
+        put('"');
+        return *this;
+    }
+
+    // "key":"value" bzw. ,"key":"value"
+    WebOut& field(const char* key, const char* value, bool first = false) {
+        if (!first) put(',');
+        json(key);
+        put(':');
+        return json(value);
+    }
+
     void end() {
         if (!open_) return;
         flush();
         server_.sendContent(static_cast<const char*>(""), 0);
         open_ = false;
+        closeConnection(server_);
     }
 
 private:
@@ -76,6 +109,13 @@ private:
     bool open_ = false;
 };
 
+// Einfache Antwort mit festem Inhalt, Verbindung danach schliessen.
+inline void sendAndClose(WebServer& server, int code, const char* contentType, const char* body) {
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(code, contentType, body);
+    closeConnection(server);
+}
+
 // Liest ein Formular-/Query-Argument in einen festen Puffer (gekürzt).
 inline void readArg(WebServer& server, const char* name, char* out, size_t outLen) {
     if (outLen == 0) return;
@@ -84,10 +124,4 @@ inline void readArg(WebServer& server, const char* name, char* out, size_t outLe
     const String v = server.arg(name);
     strncpy(out, v.c_str(), outLen - 1);
     out[outLen - 1] = '\0';
-}
-
-// 303-Weiterleitung nach einem POST (Post/Redirect/Get).
-inline void redirectTo(WebServer& server, const char* location) {
-    server.sendHeader("Location", location);
-    server.send(303, "text/plain", "");
 }
