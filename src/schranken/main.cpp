@@ -2,7 +2,8 @@
 //  Pico 2 – "Schranken"
 //
 //  - verbindet sich mit dem WLAN der Kasse (statische IP 192.168.42.2)
-//  - steuert Einfahrts- (GP8) und Ausfahrtsschranke (GP9) über SG90-Servos;
+//  - steuert Einfahrts- und Ausfahrtsschranke: standardmässig ein gemeinsamer
+//    SG90-Servo an GP8, optional zwei Servos (GP8/GP9, cfg::SERVO_COUNT);
 //    Onboard-LED leuchtet, solange eine Schranke offen ist
 //  - Weboberfläche "Kamera-Simulation": http://192.168.42.2/
 //  - jede Entscheidung trifft die Kasse (Pico 1). Ist sie nicht erreichbar,
@@ -11,6 +12,7 @@
 
 #include <Arduino.h>
 #include <HTTPClient.h>
+#include <Servo.h>
 #include <WebServer.h>
 #include <WiFi.h>
 
@@ -27,8 +29,15 @@
 namespace {
 
 WebServer server(cfg::HTTP_PORT);
-Gate entryGate("Einfahrt", cfg::SERVO_ENTRY_PIN);
-Gate exitGate("Ausfahrt", cfg::SERVO_EXIT_PIN);
+Gate entryGate("Einfahrt");
+Gate exitGate("Ausfahrt");
+
+// Servo 0 = Einfahrt bzw. gemeinsame Schranke, Servo 1 = Ausfahrt (nur bei 2 Servos).
+constexpr bool SHARED_BARRIER = cfg::SERVO_COUNT == 1;
+constexpr uint8_t SERVO_PINS[2] = {cfg::SERVO_ENTRY_PIN, cfg::SERVO_EXIT_PIN};
+Servo servos[cfg::SERVO_COUNT];
+bool servoOk[cfg::SERVO_COUNT] = {};
+bool servoOpen[cfg::SERVO_COUNT] = {};
 
 // Antworten auf wiederholte Browser-Anfragen (gleiche Request-ID).
 park::ReplayCache<6, 320> actionReplay;
@@ -62,12 +71,48 @@ void setSysMessage(const char* cls, const char* text) {
     sysMessage[sizeof(sysMessage) - 1] = '\0';
 }
 
-void updateLed() {
-    const bool on = entryGate.isOpen() || exitGate.isOpen();
+void writeServo(uint8_t i, bool open) {
+    servoOpen[i] = open;
+    servos[i].write(open ? cfg::SERVO_OPEN_DEG : cfg::SERVO_CLOSED_DEG);
+}
+
+// Bringt Servo(s) und LED in den Zustand der beiden Fahrspuren. Bei einer
+// gemeinsamen Schranke ist sie offen, solange eine der beiden Spuren offen ist.
+void updateOutputs() {
+    const bool entryOpen = entryGate.isOpen();
+    const bool exitOpen = exitGate.isOpen();
+    const bool target[2] = {SHARED_BARRIER ? (entryOpen || exitOpen) : entryOpen, exitOpen};
+    for (uint8_t i = 0; i < cfg::SERVO_COUNT; ++i) {
+        if (servoOpen[i] != target[i]) writeServo(i, target[i]);
+    }
+
+    const bool on = entryOpen || exitOpen;
     if (on != ledOn) {
         ledOn = on;
         digitalWrite(LED_BUILTIN, on ? HIGH : LOW);
     }
+}
+
+// Servo der Fahrspur (für die Anzeige "Servo-Ausgang bereit").
+bool laneServoOk(const Gate& g) { return servoOk[SHARED_BARRIER || &g == &entryGate ? 0 : 1]; }
+
+// Bei nur einer Schranke darf jeweils nur eine Richtung sie benutzen.
+const Gate* blockingGate(const Gate& lane) {
+    if (!SHARED_BARRIER) return nullptr;
+    const Gate& other = &lane == &entryGate ? exitGate : entryGate;
+    return other.isOpen() ? &other : nullptr;
+}
+
+bool rejectIfBarrierBusy(Gate& lane) {
+    const Gate* other = blockingGate(lane);
+    if (other == nullptr) return false;
+    char msg[160];
+    snprintf(msg, sizeof(msg),
+             "Schranke gerade für die %s von %s offen – bitte warten, bis dort die Durchfahrt "
+             "bestätigt ist",
+             other->name(), other->id());
+    lane.setMessage("warn", msg);
+    return true;
 }
 
 // ----------------------------------------------------------------------------
@@ -203,6 +248,7 @@ void doEntry(bool manual, const char* plate) {
         entryGate.setMessage("warn", "Einfahrt ist noch offen – zuerst Durchfahrt bestätigen");
         return;
     }
+    if (rejectIfBarrierBusy(entryGate)) return;
 
     char rid[park::ReplayCache<1, 1>::ID_LEN];
     char body[220];
@@ -224,7 +270,7 @@ void doEntry(bool manual, const char* plate) {
 
     if (strcmp(result, proto::R_GRANTED) == 0) {
         entryGate.open(id, manual, millis());
-        updateLed();
+        updateOutputs();
         if (manual) {
             snprintf(msg, sizeof(msg),
                      "Manuelle Abfertigung: Ersatz-ID %s (bitte notieren) – Einfahrt offen", id);
@@ -261,7 +307,7 @@ void doEntryPass() {
     char msg[96];
     snprintf(msg, sizeof(msg), "Durchfahrt %s bestätigt – Einfahrt zu", entryGate.id());
     entryGate.close();
-    updateLed();
+    updateOutputs();
     entryGate.setMessage("ok", msg);
 }
 
@@ -270,6 +316,7 @@ void doExit(bool manual, const char* plate) {
         exitGate.setMessage("warn", "Ausfahrt ist noch offen – zuerst Durchfahrt bestätigen");
         return;
     }
+    if (rejectIfBarrierBusy(exitGate)) return;
     if (manual && plate[0] == '\0') {
         exitGate.setMessage("err", "Manuelle Abfertigung: bitte Ersatz-ID (z. B. MANUAL-1) eingeben");
         return;
@@ -297,7 +344,7 @@ void doExit(bool manual, const char* plate) {
 
     if (strcmp(result, proto::R_OPEN) == 0) {
         exitGate.open(id, manual, millis());
-        updateLed();
+        updateOutputs();
         snprintf(msg, sizeof(msg), "Gute Fahrt %s – Ausfahrt offen", id);
         exitGate.setMessage("ok", msg);
         return;
@@ -338,7 +385,7 @@ void doExitPass() {
     strncpy(id, exitGate.id(), sizeof(id));
     const bool manual = exitGate.manual();
     exitGate.close();
-    updateLed();
+    updateOutputs();
 
     char rid[sizeof(pendingRid)];
     newRid(rid, sizeof(rid));
@@ -359,33 +406,40 @@ void doExitPass() {
     }
 }
 
-// Öffnet und schliesst beide Schranken einmal (Verdrahtung prüfen).
+// Öffnet und schliesst alle Schranken einmal (Verdrahtung prüfen).
 void runServoTest() {
     if (entryGate.isOpen() || exitGate.isOpen()) {
         setSysMessage("warn", "Test nicht möglich: eine Schranke ist gerade offen.");
         return;
     }
-    if (!entryGate.servoOk() || !exitGate.servoOk()) {
-        setSysMessage("err", "Servo-Ausgang konnte nicht eingerichtet werden – Pico 2 neu starten.");
-        return;
+    for (uint8_t i = 0; i < cfg::SERVO_COUNT; ++i) {
+        if (!servoOk[i]) {
+            setSysMessage("err", "Servo-Ausgang konnte nicht eingerichtet werden – Pico 2 neu starten.");
+            return;
+        }
     }
     Serial.println("[Schranken] Schranken-Test: oeffnen ...");
     digitalWrite(LED_BUILTIN, HIGH);
-    entryGate.moveServo(true);
-    exitGate.moveServo(true);
+    for (uint8_t i = 0; i < cfg::SERVO_COUNT; ++i) writeServo(i, true);
     delay(1200);
-    entryGate.moveServo(false);
-    exitGate.moveServo(false);
+    for (uint8_t i = 0; i < cfg::SERVO_COUNT; ++i) writeServo(i, false);
     delay(600);
     digitalWrite(LED_BUILTIN, LOW);
     ledOn = false;
     Serial.println("[Schranken] Schranken-Test: geschlossen");
 
     char msg[200];
-    snprintf(msg, sizeof(msg),
-             "Test ausgeführt: beide Schranken wurden geöffnet und wieder geschlossen "
-             "(Einfahrt GP%u, Ausfahrt GP%u). Hat sich ein Servo nicht bewegt, Verdrahtung prüfen.",
-             entryGate.pin(), exitGate.pin());
+    if (SHARED_BARRIER) {
+        snprintf(msg, sizeof(msg),
+                 "Test ausgeführt: die gemeinsame Schranke (GP%u) wurde geöffnet und wieder "
+                 "geschlossen. Hat sich der Servo nicht bewegt, Verdrahtung prüfen.",
+                 SERVO_PINS[0]);
+    } else {
+        snprintf(msg, sizeof(msg),
+                 "Test ausgeführt: beide Schranken wurden geöffnet und wieder geschlossen "
+                 "(Einfahrt GP%u, Ausfahrt GP%u). Hat sich ein Servo nicht bewegt, Verdrahtung prüfen.",
+                 SERVO_PINS[0], SERVO_PINS[1]);
+    }
     setSysMessage("ok", msg);
 }
 
@@ -483,7 +537,7 @@ constexpr const char* PAGE_BODY = R"HTML(
   </div>
   <div id=pending class='msg warn' hidden></div>
   <div class=buttons><button type=button class=secondary data-act="sys:servoTest">Schranken testen</button></div>
-  <p class=muted>Öffnet und schliesst beide Schranken einmal – zum Prüfen der Servo-Verdrahtung.</p>
+  <p class=muted>Öffnet und schliesst die Schranke(n) einmal – zum Prüfen der Servo-Verdrahtung.</p>
   <div class='msg out' hidden></div>
 </section>
 <script>
@@ -548,6 +602,13 @@ void handleRoot() {
                cfg::KASSE_IP[2], cfg::KASSE_IP[3]);
     out.printf("<a href='http://%u.%u.%u.%u/log'>Protokoll</a>", cfg::KASSE_IP[0], cfg::KASSE_IP[1],
                cfg::KASSE_IP[2], cfg::KASSE_IP[3]);
+    if (SHARED_BARRIER) {
+        out.printf("<span class=muted>Eine gemeinsame Schranke (GP%u) für Ein- und Ausfahrt</span>",
+                   SERVO_PINS[0]);
+    } else {
+        out.printf("<span class=muted>Schranken: Einfahrt GP%u, Ausfahrt GP%u</span>", SERVO_PINS[0],
+                   SERVO_PINS[1]);
+    }
     out.raw("<span class=spacer></span><div class=head-actions>"
             "<span class=muted>Browser ↔ Pico 2:</span><span id=link class='pill ok'>verbunden</span>"
             "<button class=secondary onclick='refresh()'>Aktualisieren</button></div>"
@@ -558,7 +619,7 @@ void handleRoot() {
 
 void gateJson(WebOut& out, const Gate& g, uint32_t now) {
     out.printf("{\"open\":%s,\"servo\":%s,\"left\":%lu", g.isOpen() ? "true" : "false",
-               g.servoOk() ? "true" : "false",
+               laneServoOk(g) ? "true" : "false",
                static_cast<unsigned long>((g.remainingMs(now) + 999) / 1000));
     out.field("id", g.id()).field("msg", g.message()).field("cls", g.messageClass()).raw("}");
 }
@@ -620,15 +681,20 @@ void setup() {
     digitalWrite(LED_BUILTIN, LOW);
     bootId = rp2040.hwrand32();
 
-    const bool entryOk = entryGate.begin();
-    const bool exitOk = exitGate.begin();
-    Serial.printf("[Schranken] Servo Einfahrt GP%u: %s, Ausfahrt GP%u: %s\n", entryGate.pin(),
-                  entryOk ? "bereit" : "FEHLER", exitGate.pin(), exitOk ? "bereit" : "FEHLER");
-    // Selbsttest beim Start: beide Schranken öffnen und schliessen einmal.
+    bool allServosOk = true;
+    for (uint8_t i = 0; i < cfg::SERVO_COUNT; ++i) {
+        servoOk[i] = servos[i].attach(SERVO_PINS[i], cfg::SERVO_MIN_US, cfg::SERVO_MAX_US) >= 0;
+        writeServo(i, false);
+        allServosOk = allServosOk && servoOk[i];
+        Serial.printf("[Schranken] Servo %s GP%u: %s\n",
+                      SHARED_BARRIER ? "Ein-/Ausfahrt (gemeinsam)" : (i == 0 ? "Einfahrt" : "Ausfahrt"),
+                      SERVO_PINS[i], servoOk[i] ? "bereit" : "FEHLER");
+    }
+    // Selbsttest beim Start: Schranke(n) öffnen und schliessen einmal.
     runServoTest();
-    setSysMessage(entryOk && exitOk ? "ok" : "err",
-                  entryOk && exitOk ? "Selbsttest beim Start ausgeführt (Schranken kurz geöffnet)."
-                                    : "Servo-Ausgang konnte nicht eingerichtet werden.");
+    setSysMessage(allServosOk ? "ok" : "err",
+                  allServosOk ? "Selbsttest beim Start ausgeführt (Schranke kurz geöffnet)."
+                              : "Servo-Ausgang konnte nicht eingerichtet werden.");
 
     WiFi.mode(WIFI_STA);
     startWifi();
@@ -647,7 +713,7 @@ void loop() {
 
     const uint32_t now = millis();
     checkGateTimeouts(now);
-    updateLed();
+    updateOutputs();
 
     const bool connected = WiFi.status() == WL_CONNECTED;
     if (!connected) {

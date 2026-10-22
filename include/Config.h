@@ -84,8 +84,14 @@ constexpr uint32_t STATUS_POLL_INTERVAL_MS = 5000;
 constexpr uint32_t WIFI_RECONNECT_INTERVAL_MS = 10000;
 
 // ------------------------------- Hardware (Pico 2) ---------------------------
-constexpr uint8_t SERVO_ENTRY_PIN = 8;  // GP8 (Pin 11) – Einfahrtsschranke
-constexpr uint8_t SERVO_EXIT_PIN = 9;   // GP9 (Pin 12) – Ausfahrtsschranke
+// Anzahl Servos:
+//   1 = eine gemeinsame Schranke für Ein- und Ausfahrt (Servo an GP8). Während
+//       sie für die eine Richtung offen ist, muss die andere warten.
+//   2 = getrennte Schranken: Einfahrt an GP8, Ausfahrt an GP9.
+constexpr uint8_t SERVO_COUNT = 1;
+constexpr uint8_t SERVO_ENTRY_PIN = 8;  // GP8 (Pin 11) – Einfahrt bzw. gemeinsame Schranke
+constexpr uint8_t SERVO_EXIT_PIN = 9;   // GP9 (Pin 12) – Ausfahrt (nur bei SERVO_COUNT = 2)
+static_assert(SERVO_COUNT == 1 || SERVO_COUNT == 2, "SERVO_COUNT muss 1 oder 2 sein");
 constexpr int SERVO_CLOSED_DEG = 0;     // Schranke zu (Balken waagrecht)
 constexpr int SERVO_OPEN_DEG = 90;      // Schranke offen (Balken senkrecht)
 constexpr int SERVO_MIN_US = 500;       // SG90 Pulsbreite 0°

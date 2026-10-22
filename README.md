@@ -16,7 +16,7 @@ in **Arduino (C++17)** mit PlatformIO.
 | WLAN | spannt das WLAN `Parkhaus-M450` auf (Access Point) | verbindet sich mit diesem WLAN |
 | Adresse | <http://192.168.42.1/> | <http://192.168.42.2/> |
 | Weboberfläche | Kasse/Zahlautomat (Gebühr anzeigen, bezahlen), Belegung, Register, Protokoll | Kamera-Simulation: Kennzeichen an Ein-/Ausfahrt eingeben, manuelle Abfertigung, Durchfahrt bestätigen |
-| Hardware | – | SG90-Servo Einfahrt (GP8), SG90-Servo Ausfahrt (GP9), Onboard-LED (an = Schranke offen) |
+| Hardware | – | SG90-Servo als Schranke (GP8; optional zweiter Servo für die Ausfahrt an GP9), Onboard-LED (an = Schranke offen) |
 | Code | `src/kasse/main.cpp` | `src/schranken/main.cpp`, `src/schranken/Gate.h` |
 
 - **Entscheidungen trifft immer Pico 1.** Pico 2 meldet jedes erfasste
@@ -52,33 +52,46 @@ in **Arduino (C++17)** mit PlatformIO.
 ### Abweichung von den Anforderungen
 
 Die Anforderungen sahen „keine Servos" vor und simulieren die Schranke nur mit
-der Onboard-LED. Für die Umsetzung standen SG90-Servos zur Verfügung, darum
-bewegt Pico 2 zusätzlich je einen Servo pro Schranke. Die LED leuchtet weiterhin,
-solange eine Schranke offen ist, sodass alle Testfälle unverändert gelten.
-Ohne Servos läuft das System genauso.
+der Onboard-LED. Für die Umsetzung stand ein SG90-Servo zur Verfügung, darum
+bewegt Pico 2 zusätzlich einen Servo als Schranke. Ein- und Ausfahrt bleiben
+zwei logisch getrennte Schranken (eigener Status „Einfahrt offen/zu" bzw.
+„Ausfahrt offen/zu", eigene Meldungen); der eine Servo ist ihre gemeinsame
+physische Schranke. Die LED leuchtet weiterhin, solange eine Schranke offen
+ist, sodass alle Testfälle unverändert gelten. Ohne Servo läuft das System
+genauso.
 
 ## Aufbau / Verdrahtung (Pico 2)
 
-| SG90 | Einfahrt | Ausfahrt |
-|---|---|---|
-| orange (Signal) | GP8 (Pin 11) | GP9 (Pin 12) |
-| rot (VCC) | VBUS (Pin 40) | VBUS (Pin 40) |
-| braun (GND) | GND (z. B. Pin 38) | GND (z. B. Pin 38) |
+**Standard: ein Servo** (`SERVO_COUNT = 1` in `include/Config.h`) – eine
+gemeinsame Schranke für Ein- und Ausfahrt:
 
-VBUS und GND am besten auf die Plus/Minus-Schiene des Breadboards legen und
-beide Servos dort anschliessen. Pins und Winkel (`SERVO_OPEN_DEG`,
-`SERVO_CLOSED_DEG`) sind in `include/Config.h` einstellbar.
+| SG90-Kabel | Pico 2 |
+|---|---|
+| orange (Signal) | GP8 (Pin 11) |
+| rot (VCC) | VBUS (Pin 40) |
+| braun (GND) | GND (z. B. Pin 38) |
+
+Ist die Schranke gerade für die Einfahrt offen, wird eine Ausfahrt mit
+„Schranke gerade für die Einfahrt … offen – bitte warten" abgewiesen (und
+umgekehrt), bis die Durchfahrt bestätigt ist oder der 30-s-Timeout greift.
+
+**Optional: zwei Servos** (`SERVO_COUNT = 2`) – getrennte Schranken, Einfahrt
+an GP8 (Pin 11) und Ausfahrt an GP9 (Pin 12); rot/braun beider Servos an
+VBUS/GND, am besten über die Plus/Minus-Schiene des Breadboards.
+
+Pins und Winkel (`SERVO_OPEN_DEG`, `SERVO_CLOSED_DEG`) sind in
+`include/Config.h` einstellbar. Nach einer Änderung Pico 2 neu flashen.
 Pico 1 braucht nur USB-Strom.
 
-**Servo prüfen:** Beim Einschalten öffnet und schliesst Pico 2 beide
-Schranken einmal (Selbsttest). Auf der Kamera-Simulation kann der Test unter
-„Status" jederzeit mit **„Schranken testen"** wiederholt werden. Bewegt sich
-ein Servo dabei nicht:
+**Servo prüfen:** Beim Einschalten öffnet und schliesst Pico 2 die
+Schranke(n) einmal (Selbsttest). Auf der Kamera-Simulation kann der Test unter
+„Status" jederzeit mit **„Schranken testen"** wiederholt werden. Der
+Seitenkopf zeigt, welche Variante aktiv ist. Bewegt sich ein Servo dabei nicht:
 
 | Prüfen | Hinweis |
 |---|---|
 | Signal am richtigen Pin? | GP8 ist **Pin 11** (linke Seite, 11. Pin von oben bei USB-Buchse oben), GP9 ist Pin 12. „GP8" ≠ „Pin 8" (Pin 8 ist GND) |
-| Am richtigen Pico? | Die Servos gehören an **Pico 2 (Schranken)** |
+| Am richtigen Pico? | Der Servo gehört an **Pico 2 (Schranken)** |
 | Strom? | Rot an **VBUS (Pin 40)**, nicht an 3V3. VBUS liefert nur 5 V, wenn der Pico per USB versorgt wird |
 | Masse? | Braun an einen **GND**-Pin desselben Pico |
 | Stecker richtig herum? | Reihenfolge am Servo-Stecker: orange – rot – braun |
@@ -117,7 +130,7 @@ den Pico anschliessen, der gerade geflasht wird.
    `Parkhaus-M450` ist sichtbar.
 6. Pico 1 abziehen, **Pico 2** genauso mit **`schranken.uf2`** flashen
    (Schritte 2–5).
-   **Kontrolle:** Die Servos fahren in die Position „zu", die LED bleibt aus.
+   **Kontrolle:** Der Servo öffnet und schliesst einmal (Selbsttest), die LED bleibt danach aus.
    Auf <http://192.168.42.2/> zeigt „Verbindung zur Kasse" erst „OK", wenn
    Pico 1 ebenfalls läuft.
 
