@@ -116,6 +116,9 @@ den Pico anschliessen, der gerade geflasht wird.
    beim ersten Mal 1–3 Minuten. Danach öffnet sich der Ordner `firmware\` mit
    - `kasse.uf2` → für **Pico 1 (Kasse)**
    - `schranken.uf2` → für **Pico 2 (Schranken)**
+   - `schranken-failsafe-TC38.uf2` → nur für Testfall TC-38 auf Pico 2:
+     Pico 2 erreicht die Kasse absichtlich nicht (Schranke muss zu bleiben).
+     Nach dem Test wieder `schranken.uf2` aufspielen.
 2. **Pico 1 in den BOOTSEL-Modus bringen:** USB-Kabel vom Pico abziehen,
    die weisse Taste **BOOTSEL** auf dem Pico gedrückt halten, Kabel
    einstecken, Taste loslassen.
@@ -202,7 +205,7 @@ Parksystem"; Testfälle: „Testkonzept Parksystem" (TC-01 bis TC-41).
 | **US6** Belegung anzeigen | ✅ | Kapazität/belegt/frei auf der Kasse, freie Plätze auch auf der Kamera-Simulation; Zähler wird aus dem Register berechnet (nie < 0, nie > Kapazität) |
 | **US7** Protokoll für den Besitzer | ✅ | Ringpuffer mit fortlaufender Nummer; zeitlich sortiert; Überschreiben wird angezeigt (fehlende Nummern + Hinweis); CSV mit `;`-Trennung, 7 Felder pro Zeile |
 | **US8** Manuelle Abfertigung | ✅ | Button „Manuelle Abfertigung" vergibt `MANUAL-<n>`; bei vollem Parkhaus abgelehnt; Ausfahrt mit Ersatz-ID wie US3–US5; im Protokoll Spalte `manuell = ja` |
-| Fail-safe | ✅ | Ohne gültige Antwort der Kasse (3 Versuche à 1 s / WLAN weg) bleibt jede Schranke zu |
+| Fail-safe | ✅ | Ohne gültige Antwort der Kasse (3 Versuche à 1 s / WLAN weg) bleibt jede Schranke zu; nach einem WLAN-Abbruch (z. B. Neustart der Kasse) verbindet sich Pico 2 selbst wieder |
 | Reaktionszeit ≤ 2 s | ✅ | Eine HTTP-Anfrage im lokalen WLAN, danach sofort Servo/LED |
 | Datenkonsistenz | ✅ | Jedes Kennzeichen max. einmal im Register; doppelte Bestätigung wird auf Pico 2 und Pico 1 abgewiesen; höchstens `CAPACITY` Fahrzeuge „im Parkhaus" |
 | Robuste Eingaben | ✅ | Eingaben werden gekürzt, validiert und HTML-escaped; Protokoll enthält nur bereinigten Text |
@@ -236,6 +239,7 @@ src/kasse/main.cpp        Firmware Pico 1
 src/schranken/            Firmware Pico 2
 docs/HTTP-Protokoll.md    Schnittstellenbeschreibung
 test/host/                Komponententests der Logik (PC)
-platformio.ini            Environments "kasse" und "schranken"
-build-firmware.bat        baut beide Firmwares → firmware\kasse.uf2, firmware\schranken.uf2
+platformio.ini            Environments "kasse", "schranken" und "schranken-failsafe" (TC-38)
+build-firmware.bat        baut die Firmwares → firmware\kasse.uf2, firmware\schranken.uf2,
+                          firmware\schranken-failsafe-TC38.uf2
 ```

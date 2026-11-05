@@ -15,6 +15,7 @@
 #include <Servo.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <cyw43.h>
 
 #include "Config.h"
 #include "EventLog.h"
@@ -61,6 +62,8 @@ uint32_t bootId = 0;
 uint32_t ridCounter = 0;
 uint32_t lastStatusPollMs = 0;
 uint32_t lastWifiAttemptMs = 0;
+uint32_t linkLostSinceMs = 0;  // 0 = WLAN-Link vorhanden
+uint32_t lastKasseOkMs = 0;    // letzte gültige Antwort der Kasse
 bool ledOn = false;
 
 IPAddress toIp(const uint8_t (&a)[4]) { return IPAddress(a[0], a[1], a[2], a[3]); }
@@ -147,8 +150,8 @@ void newRid(char* out, size_t len) {
 // Ein einzelner HTTP-Versuch. `code` < 0 = Verbindungsfehler/Timeout.
 bool callKasseOnce(const char* path, const char* formBody, char* resp, size_t respLen, int& code) {
     char url[64];
-    snprintf(url, sizeof(url), "http://%u.%u.%u.%u%s", cfg::KASSE_IP[0], cfg::KASSE_IP[1],
-             cfg::KASSE_IP[2], cfg::KASSE_IP[3], path);
+    snprintf(url, sizeof(url), "http://%u.%u.%u.%u%s", cfg::KASSE_API_IP[0], cfg::KASSE_API_IP[1],
+             cfg::KASSE_API_IP[2], cfg::KASSE_API_IP[3], path);
 
     WiFiClient client;
     HTTPClient http;
@@ -188,6 +191,7 @@ bool callKasse(const char* path, const char* formBody, char* resp, size_t respLe
         if (WiFi.status() != WL_CONNECTED) break;
         if (callKasseOnce(path, formBody, resp, respLen, code)) {
             kasseOnline = true;
+            lastKasseOkMs = millis();
             char value[12];
             if (proto::getField(resp, proto::F_FREE, value, sizeof(value))) {
                 freeSpaces = static_cast<unsigned>(atoi(value));
@@ -612,8 +616,12 @@ void handleRoot() {
     out.raw("<span class=spacer></span><div class=head-actions>"
             "<span class=muted>Browser ↔ Pico 2:</span><span id=link class='pill ok'>verbunden</span>"
             "<button class=secondary onclick='refresh()'>Aktualisieren</button></div>"
-            "</header><main>")
-        .raw(PAGE_BODY)
+            "</header><main>");
+    if (PARK_FAILSAFE_TEST) {
+        out.raw("<div class='msg err'>Test-Firmware für TC-38 (Fail-safe): Pico 2 erreicht die Kasse "
+                "absichtlich nicht. Nach dem Test wieder schranken.uf2 aufspielen!</div>");
+    }
+    out.raw(PAGE_BODY)
         .raw("</main></body></html>");
 }
 
@@ -646,8 +654,35 @@ void handleNotFound() { sendAndClose(server, 404, "text/plain; charset=utf-8", "
 
 void startWifi() {
     WiFi.config(toIp(cfg::SCHRANKEN_IP), toIp(cfg::KASSE_IP), toIp(cfg::KASSE_IP), toIp(cfg::NETMASK));
+    // Blockiert trotz "NoBlock" bis zum Verbindungsaufbau, höchstens WIFI_JOIN_TIMEOUT_MS.
     WiFi.beginNoBlock(cfg::WIFI_SSID, cfg::WIFI_PASSWORD);
     lastWifiAttemptMs = millis();
+    linkLostSinceMs = 0;
+    lastKasseOkMs = lastWifiAttemptMs;
+}
+
+// Mit statischer IP meldet WiFi.status() auch nach einem Abbruch der
+// WLAN-Verbindung (z. B. Neustart der Kasse) weiterhin WL_CONNECTED, weil nur
+// die IP-Adresse geprüft wird. Der tatsächliche Link-Zustand kommt vom
+// WLAN-Chip; der Treiber setzt ihn beim Verbindungsverlust zurück.
+bool wifiLinkUp() {
+    return WiFi.status() == WL_CONNECTED &&
+           cyw43_wifi_link_status(&cyw43_state, CYW43_ITF_STA) == CYW43_LINK_JOIN;
+}
+
+// Liefert true, wenn die WLAN-Verbindung neu aufgebaut werden muss: Link seit
+// WIFI_LINK_LOST_MS weg oder die Kasse antwortet seit KASSE_SILENT_RECONNECT_MS
+// nicht mehr, obwohl der Link scheinbar steht.
+bool wifiNeedsReconnect(uint32_t now) {
+    if (!wifiLinkUp()) {
+        if (linkLostSinceMs == 0) {
+            linkLostSinceMs = now == 0 ? 1 : now;
+            Serial.println("[Schranken] WLAN-Link verloren");
+        }
+        return now - linkLostSinceMs >= cfg::WIFI_LINK_LOST_MS;
+    }
+    linkLostSinceMs = 0;
+    return now - lastKasseOkMs >= cfg::KASSE_SILENT_RECONNECT_MS;
 }
 
 void checkGateTimeouts(uint32_t now) {
@@ -697,6 +732,7 @@ void setup() {
                               : "Servo-Ausgang konnte nicht eingerichtet werden.");
 
     WiFi.mode(WIFI_STA);
+    WiFi.setTimeout(cfg::WIFI_JOIN_TIMEOUT_MS);
     startWifi();
 
     server.on("/", HTTP_GET, handleRoot);
@@ -715,13 +751,17 @@ void loop() {
     checkGateTimeouts(now);
     updateOutputs();
 
-    const bool connected = WiFi.status() == WL_CONNECTED;
-    if (!connected) {
+    if (wifiNeedsReconnect(now)) {
         kasseOnline = false;
         if (now - lastWifiAttemptMs >= cfg::WIFI_RECONNECT_INTERVAL_MS) {
-            Serial.println("[Schranken] WLAN getrennt – neuer Verbindungsversuch");
+            Serial.println("[Schranken] WLAN getrennt bzw. Kasse stumm – neuer Verbindungsversuch");
             startWifi();
+            Serial.printf("[Schranken] WLAN %s\n", wifiLinkUp() ? "wieder verbunden" : "noch nicht verbunden");
         }
+        return;
+    }
+    if (!wifiLinkUp()) {
+        kasseOnline = false;
         return;
     }
 

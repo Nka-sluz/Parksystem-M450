@@ -15,17 +15,19 @@ if not "%PIO%"=="pio" if not exist "%PIO%" (
 )
 
 echo Baue Firmware fuer Pico 1 ^(kasse^) und Pico 2 ^(schranken^) ...
-"%PIO%" run -e kasse -e schranken
+"%PIO%" run -e kasse -e schranken -e schranken-failsafe
 if errorlevel 1 goto fail
 
 if not exist firmware mkdir firmware
 copy /y ".pio\build\kasse\firmware.uf2" "firmware\kasse.uf2" >nul || goto fail
 copy /y ".pio\build\schranken\firmware.uf2" "firmware\schranken.uf2" >nul || goto fail
+copy /y ".pio\build\schranken-failsafe\firmware.uf2" "firmware\schranken-failsafe-TC38.uf2" >nul || goto fail
 
 echo.
 echo Fertig:
 echo   firmware\kasse.uf2      -^> auf Pico 1 ^(Kasse^) kopieren
 echo   firmware\schranken.uf2  -^> auf Pico 2 ^(Schranken^) kopieren
+echo   firmware\schranken-failsafe-TC38.uf2 -^> nur fuer Testfall TC-38 auf Pico 2
 start "" explorer "%~dp0firmware"
 call :pauseIfDoubleClicked
 exit /b 0

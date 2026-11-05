@@ -82,6 +82,22 @@ constexpr uint16_t KASSE_HTTP_RETRY_DELAY_MS = 150;
 constexpr uint32_t STATUS_POLL_INTERVAL_MS = 5000;
 // Pico 2 versucht in diesem Abstand, die WLAN-Verbindung wiederherzustellen.
 constexpr uint32_t WIFI_RECONNECT_INTERVAL_MS = 10000;
+// Längste Wartezeit eines Verbindungsversuchs (Pico 2 ist währenddessen blockiert).
+constexpr uint32_t WIFI_JOIN_TIMEOUT_MS = 5000;
+// So lange muss der WLAN-Link weg sein, bevor Pico 2 neu verbindet.
+constexpr uint32_t WIFI_LINK_LOST_MS = 2000;
+// Antwortet die Kasse so lange nicht (trotz scheinbar stehendem Link), baut
+// Pico 2 die WLAN-Verbindung neu auf.
+constexpr uint32_t KASSE_SILENT_RECONNECT_MS = 30000;
+
+// Nur für den Fail-safe-Test TC-38 (Build "schranken-failsafe"): Pico 2 schickt
+// seine Anfragen an eine Adresse, unter der keine Kasse antwortet. Das WLAN
+// der Kasse bleibt dabei bestehen, die Weboberfläche von Pico 2 erreichbar.
+#ifndef PARK_FAILSAFE_TEST
+#define PARK_FAILSAFE_TEST 0
+#endif
+constexpr uint8_t KASSE_API_IP[4] = {KASSE_IP[0], KASSE_IP[1], KASSE_IP[2],
+                                     PARK_FAILSAFE_TEST ? uint8_t{99} : KASSE_IP[3]};
 
 // ------------------------------- Hardware (Pico 2) ---------------------------
 // Anzahl Servos:
