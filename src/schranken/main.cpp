@@ -8,20 +8,23 @@
 //  - Weboberfläche "Kamera-Simulation": http://192.168.42.2/
 //  - jede Entscheidung trifft die Kasse (Pico 1). Ist sie nicht erreichbar,
 //    bleiben beide Schranken geschlossen (Fail-safe).
+//
+//  Die Logik steckt in park::GateController (lib/ParkCore). Diese Datei
+//  verbindet sie mit der echten Hardware (Servo, LED, millis(), HTTP/WLAN)
+//  und der Weboberfläche.
 // =============================================================================
 
 #include <Arduino.h>
-#include <HTTPClient.h>
-#include <Servo.h>
 #include <WebServer.h>
 #include <WiFi.h>
 #include <cyw43.h>
 
 #include "Config.h"
-#include "EventLog.h"
 #include "Format.h"
-#include "Gate.h"
-#include "Protocol.h"
+#include "GateController.h"
+#include "HttpKasse.h"
+#include "PicoClock.h"
+#include "PicoOutputs.h"
 #include "ReplayCache.h"
 #include "WebOut.h"
 #include "WebScript.h"
@@ -30,41 +33,27 @@
 namespace {
 
 WebServer server(cfg::HTTP_PORT);
-Gate entryGate("Einfahrt");
-Gate exitGate("Ausfahrt");
 
 // Servo 0 = Einfahrt bzw. gemeinsame Schranke, Servo 1 = Ausfahrt (nur bei 2 Servos).
 constexpr bool SHARED_BARRIER = cfg::SERVO_COUNT == 1;
 constexpr uint8_t SERVO_PINS[2] = {cfg::SERVO_ENTRY_PIN, cfg::SERVO_EXIT_PIN};
-Servo servos[cfg::SERVO_COUNT];
-bool servoOk[cfg::SERVO_COUNT] = {};
-bool servoOpen[cfg::SERVO_COUNT] = {};
+ServoBarrier barriers[cfg::SERVO_COUNT];
+LedLamp led;
+HttpKasse kasse;
+PicoClock picoClock;
+// Bei einem Servo zeigen beide Fahrspuren auf dieselbe Schranke.
+park::GateController gates(barriers[0], barriers[cfg::SERVO_COUNT - 1], led, kasse, picoClock);
 
 // Antworten auf wiederholte Browser-Anfragen (gleiche Request-ID).
 park::ReplayCache<6, 320> actionReplay;
-
-// Zuletzt von der Kasse gemeldete Belegung (nur Anzeige).
-bool freeKnown = false;
-unsigned freeSpaces = 0;
-unsigned capacity = cfg::CAPACITY;
-bool kasseOnline = false;
 
 // Meldung im Bereich "Status" (Schranken-Test, Servo-Fehler).
 const char* sysCls = "ok";
 char sysMessage[200] = "";
 
-// Bestätigte Ausfahrt, die die Kasse noch nicht quittiert hat (wird wiederholt).
-char pendingExit[cfg::ID_BUF_LEN] = "";
-bool pendingExitManual = false;
-char pendingRid[park::ReplayCache<1, 1>::ID_LEN] = "";
-
-uint32_t bootId = 0;
-uint32_t ridCounter = 0;
 uint32_t lastStatusPollMs = 0;
 uint32_t lastWifiAttemptMs = 0;
 uint32_t linkLostSinceMs = 0;  // 0 = WLAN-Link vorhanden
-uint32_t lastKasseOkMs = 0;    // letzte gültige Antwort der Kasse
-bool ledOn = false;
 
 IPAddress toIp(const uint8_t (&a)[4]) { return IPAddress(a[0], a[1], a[2], a[3]); }
 
@@ -74,362 +63,30 @@ void setSysMessage(const char* cls, const char* text) {
     sysMessage[sizeof(sysMessage) - 1] = '\0';
 }
 
-void writeServo(uint8_t i, bool open) {
-    servoOpen[i] = open;
-    servos[i].write(open ? cfg::SERVO_OPEN_DEG : cfg::SERVO_CLOSED_DEG);
-}
-
-// Bringt Servo(s) und LED in den Zustand der beiden Fahrspuren. Bei einer
-// gemeinsamen Schranke ist sie offen, solange eine der beiden Spuren offen ist.
-void updateOutputs() {
-    const bool entryOpen = entryGate.isOpen();
-    const bool exitOpen = exitGate.isOpen();
-    const bool target[2] = {SHARED_BARRIER ? (entryOpen || exitOpen) : entryOpen, exitOpen};
-    for (uint8_t i = 0; i < cfg::SERVO_COUNT; ++i) {
-        if (servoOpen[i] != target[i]) writeServo(i, target[i]);
-    }
-
-    const bool on = entryOpen || exitOpen;
-    if (on != ledOn) {
-        ledOn = on;
-        digitalWrite(LED_BUILTIN, on ? HIGH : LOW);
-    }
-}
-
 // Servo der Fahrspur (für die Anzeige "Servo-Ausgang bereit").
-bool laneServoOk(const Gate& g) { return servoOk[SHARED_BARRIER || &g == &entryGate ? 0 : 1]; }
-
-// Bei nur einer Schranke darf jeweils nur eine Richtung sie benutzen.
-const Gate* blockingGate(const Gate& lane) {
-    if (!SHARED_BARRIER) return nullptr;
-    const Gate& other = &lane == &entryGate ? exitGate : entryGate;
-    return other.isOpen() ? &other : nullptr;
-}
-
-bool rejectIfBarrierBusy(Gate& lane) {
-    const Gate* other = blockingGate(lane);
-    if (other == nullptr) return false;
-    char msg[160];
-    snprintf(msg, sizeof(msg),
-             "Schranke gerade für die %s von %s offen – bitte warten, bis dort die Durchfahrt "
-             "bestätigt ist",
-             other->name(), other->id());
-    lane.setMessage("warn", msg);
-    return true;
-}
-
-// ----------------------------------------------------------------------------
-//  Kommunikation mit der Kasse
-// ----------------------------------------------------------------------------
-
-void urlEncode(const char* in, char* out, size_t outLen) {
-    static const char hex[] = "0123456789ABCDEF";
-    size_t o = 0;
-    for (; *in != '\0'; ++in) {
-        const unsigned char c = static_cast<unsigned char>(*in);
-        const bool plain = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
-                           c == '-' || c == '_' || c == '.';
-        if (plain) {
-            if (o + 1 >= outLen) break;
-            out[o++] = static_cast<char>(c);
-        } else {
-            if (o + 3 >= outLen) break;
-            out[o++] = '%';
-            out[o++] = hex[c >> 4];
-            out[o++] = hex[c & 0x0F];
-        }
-    }
-    out[o] = '\0';
-}
-
-void newRid(char* out, size_t len) {
-    snprintf(out, len, "p2-%08lx-%lu", static_cast<unsigned long>(bootId),
-             static_cast<unsigned long>(++ridCounter));
-}
-
-// Ein einzelner HTTP-Versuch. `code` < 0 = Verbindungsfehler/Timeout.
-bool callKasseOnce(const char* path, const char* formBody, char* resp, size_t respLen, int& code) {
-    char url[64];
-    snprintf(url, sizeof(url), "http://%u.%u.%u.%u%s", cfg::KASSE_API_IP[0], cfg::KASSE_API_IP[1],
-             cfg::KASSE_API_IP[2], cfg::KASSE_API_IP[3], path);
-
-    WiFiClient client;
-    HTTPClient http;
-    http.setTimeout(cfg::KASSE_HTTP_TIMEOUT_MS);
-    http.setReuse(false);
-    code = -1;
-    if (!http.begin(client, url)) return false;
-
-    if (formBody != nullptr) {
-        http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-        code = http.POST(reinterpret_cast<uint8_t*>(const_cast<char*>(formBody)), strlen(formBody));
-    } else {
-        code = http.GET();
-    }
-
-    bool ok = false;
-    if (code == 200) {
-        const String body = http.getString();
-        strncpy(resp, body.c_str(), respLen - 1);
-        resp[respLen - 1] = '\0';
-        // Eine Antwort ohne result-Feld gilt als abgebrochen.
-        char result[16];
-        ok = proto::getField(resp, proto::F_RESULT, result, sizeof(result));
-    }
-    http.end();
-    return ok;
-}
-
-// Sendet eine Anfrage an die Kasse, bei Verbindungsfehlern mit Wiederholungen
-// (der Body enthält eine Request-ID, die Kasse führt die Aktion nur einmal aus).
-// Liefert false, wenn keine gültige Antwort kam – die Schranke bleibt dann zu.
-bool callKasse(const char* path, const char* formBody, char* resp, size_t respLen,
-               uint8_t attempts = cfg::KASSE_HTTP_ATTEMPTS) {
-    resp[0] = '\0';
-    int code = -1;
-    for (uint8_t i = 0; i < attempts; ++i) {
-        if (WiFi.status() != WL_CONNECTED) break;
-        if (callKasseOnce(path, formBody, resp, respLen, code)) {
-            kasseOnline = true;
-            lastKasseOkMs = millis();
-            char value[12];
-            if (proto::getField(resp, proto::F_FREE, value, sizeof(value))) {
-                freeSpaces = static_cast<unsigned>(atoi(value));
-                freeKnown = true;
-            }
-            if (i > 0) Serial.printf("[Schranken] %s: Erfolg im %u. Versuch\n", path, i + 1);
-            return true;
-        }
-        Serial.printf("[Schranken] %s: Versuch %u fehlgeschlagen (Code %d)\n", path, i + 1, code);
-        if (code >= 400) break;  // fachlich/formal abgelehnt – Wiederholen hilft nicht
-        if (i + 1 < attempts) delay(cfg::KASSE_HTTP_RETRY_DELAY_MS);
-    }
-    kasseOnline = false;
-    return false;
-}
-
-void buildBody(char* out, size_t outLen, const char* plate, bool manual, const char* rid) {
-    if (plate == nullptr) {
-        snprintf(out, outLen, "%s=1&%s=%s", proto::P_MANUAL, proto::P_RID, rid);
-        return;
-    }
-    char encoded[160];
-    urlEncode(plate, encoded, sizeof(encoded));
-    snprintf(out, outLen, "%s=%s%s&%s=%s", proto::P_PLATE, encoded, manual ? "&manual=1" : "",
-             proto::P_RID, rid);
-}
-
-park::Reason reasonOf(const char* resp) {
-    char token[24];
-    proto::getField(resp, proto::F_REASON, token, sizeof(token));
-    return park::reasonFromToken(token);
-}
-
-void pollStatus() {
-    char resp[128];
-    // Nur ein Versuch: die Abfrage wiederholt sich ohnehin alle paar Sekunden.
-    if (!callKasse(proto::PATH_STATUS, nullptr, resp, sizeof(resp), 1)) return;
-    char value[12];
-    if (proto::getField(resp, proto::F_CAPACITY, value, sizeof(value))) {
-        capacity = static_cast<unsigned>(atoi(value));
-    }
-}
-
-bool sendExitConfirm(const char* id, bool manual, const char* rid) {
-    char body[220];
-    char resp[128];
-    buildBody(body, sizeof(body), id, manual, rid);
-    // Auch eine fachliche Ablehnung (z. B. bereits ausgefahren) gilt als quittiert.
-    return callKasse(proto::PATH_EXIT_CONFIRM, body, resp, sizeof(resp));
-}
-
-// ----------------------------------------------------------------------------
-//  Aktionen (werden von der Weboberfläche über /api/action ausgelöst)
-// ----------------------------------------------------------------------------
-
-void doEntry(bool manual, const char* plate) {
-    if (entryGate.isOpen()) {
-        entryGate.setMessage("warn", "Einfahrt ist noch offen – zuerst Durchfahrt bestätigen");
-        return;
-    }
-    if (rejectIfBarrierBusy(entryGate)) return;
-
-    char rid[park::ReplayCache<1, 1>::ID_LEN];
-    char body[220];
-    char resp[160];
-    newRid(rid, sizeof(rid));
-    buildBody(body, sizeof(body), manual ? nullptr : plate, false, rid);
-
-    if (!callKasse(proto::PATH_ENTRY, body, resp, sizeof(resp))) {
-        entryGate.setMessage("err", "Keine Verbindung zur Kasse – Schranke bleibt geschlossen. "
-                                    "Bitte erneut versuchen.");
-        return;
-    }
-
-    char result[16];
-    char id[cfg::ID_BUF_LEN];
-    char msg[160];
-    proto::getField(resp, proto::F_RESULT, result, sizeof(result));
-    proto::getField(resp, proto::F_ID, id, sizeof(id));
-
-    if (strcmp(result, proto::R_GRANTED) == 0) {
-        entryGate.open(id, manual, millis());
-        updateOutputs();
-        if (manual) {
-            snprintf(msg, sizeof(msg),
-                     "Manuelle Abfertigung: Ersatz-ID %s (bitte notieren) – Einfahrt offen", id);
-        } else {
-            snprintf(msg, sizeof(msg), "Willkommen %s – Einfahrt offen", id);
-        }
-        entryGate.setMessage("ok", msg);
-        return;
-    }
-
-    const park::Reason reason = reasonOf(resp);
-    switch (reason) {
-        case park::Reason::Invalid:
-            snprintf(msg, sizeof(msg),
-                     "Kennzeichen ungültig – Schranke bleibt geschlossen. Manuelle Abfertigung möglich.");
-            break;
-        case park::Reason::Duplicate:
-            snprintf(msg, sizeof(msg), "%s: bereits eingefahren – Schranke bleibt geschlossen", id);
-            break;
-        case park::Reason::Full:
-            snprintf(msg, sizeof(msg), "Parkhaus voll – Schranke bleibt geschlossen");
-            break;
-        default:
-            snprintf(msg, sizeof(msg), "Einfahrt verweigert: %s", park::reasonMessage(reason));
-    }
-    entryGate.setMessage("err", msg);
-}
-
-void doEntryPass() {
-    if (!entryGate.isOpen()) {
-        entryGate.setMessage("warn", "Schranke ist nicht offen – nichts zu bestätigen");
-        return;
-    }
-    char msg[96];
-    snprintf(msg, sizeof(msg), "Durchfahrt %s bestätigt – Einfahrt zu", entryGate.id());
-    entryGate.close();
-    updateOutputs();
-    entryGate.setMessage("ok", msg);
-}
-
-void doExit(bool manual, const char* plate) {
-    if (exitGate.isOpen()) {
-        exitGate.setMessage("warn", "Ausfahrt ist noch offen – zuerst Durchfahrt bestätigen");
-        return;
-    }
-    if (rejectIfBarrierBusy(exitGate)) return;
-    if (manual && plate[0] == '\0') {
-        exitGate.setMessage("err", "Manuelle Abfertigung: bitte Ersatz-ID (z. B. MANUAL-1) eingeben");
-        return;
-    }
-
-    char rid[park::ReplayCache<1, 1>::ID_LEN];
-    char body[220];
-    char resp[160];
-    newRid(rid, sizeof(rid));
-    buildBody(body, sizeof(body), plate, manual, rid);
-
-    if (!callKasse(proto::PATH_EXIT_CHECK, body, resp, sizeof(resp))) {
-        exitGate.setMessage("err", "Keine Verbindung zur Kasse – Ausfahrt bleibt geschlossen "
-                                   "(Fail-safe). Bitte erneut versuchen.");
-        return;
-    }
-
-    char result[16];
-    char id[cfg::ID_BUF_LEN];
-    char dueText[16];
-    char msg[160];
-    proto::getField(resp, proto::F_RESULT, result, sizeof(result));
-    proto::getField(resp, proto::F_ID, id, sizeof(id));
-    proto::getField(resp, proto::F_DUE, dueText, sizeof(dueText));
-
-    if (strcmp(result, proto::R_OPEN) == 0) {
-        exitGate.open(id, manual, millis());
-        updateOutputs();
-        snprintf(msg, sizeof(msg), "Gute Fahrt %s – Ausfahrt offen", id);
-        exitGate.setMessage("ok", msg);
-        return;
-    }
-
-    const park::Reason reason = reasonOf(resp);
-    char due[16];
-    park::formatMoney(static_cast<cfg::Money>(atol(dueText)), due, sizeof(due));
-    switch (reason) {
-        case park::Reason::Unpaid:
-            snprintf(msg, sizeof(msg), "Bitte zuerst bezahlen – offener Betrag CHF %s (%s)", due, id);
-            break;
-        case park::Reason::Unknown:
-            snprintf(msg, sizeof(msg),
-                     "%s ist nicht im Register – bitte manuelle Abfertigung "
-                     "(Ersatz-ID eingeben oder Personal rufen)",
-                     id);
-            break;
-        case park::Reason::Exited:
-            snprintf(msg, sizeof(msg), "%s ist bereits ausgefahren – bitte manuelle Abfertigung", id);
-            break;
-        case park::Reason::Invalid:
-            snprintf(msg, sizeof(msg), "Kennzeichen ungültig – bitte manuelle Abfertigung");
-            break;
-        default:
-            snprintf(msg, sizeof(msg), "Ausfahrt verweigert: %s", park::reasonMessage(reason));
-    }
-    exitGate.setMessage("err", msg);
-}
-
-void doExitPass() {
-    if (!exitGate.isOpen()) {
-        exitGate.setMessage("warn", "Schranke ist nicht offen – nichts zu bestätigen");
-        return;
-    }
-
-    char id[cfg::ID_BUF_LEN];
-    strncpy(id, exitGate.id(), sizeof(id));
-    const bool manual = exitGate.manual();
-    exitGate.close();
-    updateOutputs();
-
-    char rid[sizeof(pendingRid)];
-    newRid(rid, sizeof(rid));
-    char msg[160];
-    if (sendExitConfirm(id, manual, rid)) {
-        snprintf(msg, sizeof(msg), "Durchfahrt %s bestätigt – Ausfahrt zu", id);
-        exitGate.setMessage("ok", msg);
-    } else {
-        // Fahrzeug ist bereits durch – Meldung an die Kasse wird mit derselben
-        // Request-ID nachgeholt.
-        strncpy(pendingExit, id, sizeof(pendingExit));
-        strncpy(pendingRid, rid, sizeof(pendingRid));
-        pendingExitManual = manual;
-        snprintf(msg, sizeof(msg),
-                 "Durchfahrt %s bestätigt – Ausfahrt zu. Kasse nicht erreichbar, Meldung wird wiederholt.",
-                 id);
-        exitGate.setMessage("warn", msg);
-    }
+bool laneServoOk(const park::Gate& g) {
+    return barriers[SHARED_BARRIER || &g == &gates.entryGate() ? 0 : 1].ok();
 }
 
 // Öffnet und schliesst alle Schranken einmal (Verdrahtung prüfen).
 void runServoTest() {
-    if (entryGate.isOpen() || exitGate.isOpen()) {
+    if (gates.anyOpen()) {
         setSysMessage("warn", "Test nicht möglich: eine Schranke ist gerade offen.");
         return;
     }
-    for (uint8_t i = 0; i < cfg::SERVO_COUNT; ++i) {
-        if (!servoOk[i]) {
+    for (const ServoBarrier& b : barriers) {
+        if (!b.ok()) {
             setSysMessage("err", "Servo-Ausgang konnte nicht eingerichtet werden – Pico 2 neu starten.");
             return;
         }
     }
     Serial.println("[Schranken] Schranken-Test: oeffnen ...");
-    digitalWrite(LED_BUILTIN, HIGH);
-    for (uint8_t i = 0; i < cfg::SERVO_COUNT; ++i) writeServo(i, true);
+    led.set(true);
+    for (ServoBarrier& b : barriers) b.open();
     delay(1200);
-    for (uint8_t i = 0; i < cfg::SERVO_COUNT; ++i) writeServo(i, false);
+    for (ServoBarrier& b : barriers) b.close();
     delay(600);
-    digitalWrite(LED_BUILTIN, LOW);
-    ledOn = false;
+    led.set(false);
     Serial.println("[Schranken] Schranken-Test: geschlossen");
 
     char msg[200];
@@ -466,28 +123,33 @@ void handleAction() {
 
     const char* cls = "err";
     const char* msg = "Unbekannte Aktion";
-    if (strcmp(action, "entry") == 0 || strcmp(action, "entryManual") == 0 ||
-        strcmp(action, "entryPass") == 0) {
-        if (strcmp(action, "entryPass") == 0) {
-            doEntryPass();
-        } else {
-            doEntry(strcmp(action, "entryManual") == 0, plate);
-        }
-        cls = entryGate.messageClass();
-        msg = entryGate.message();
-    } else if (strcmp(action, "exit") == 0 || strcmp(action, "exitManual") == 0 ||
-               strcmp(action, "exitPass") == 0) {
-        if (strcmp(action, "exitPass") == 0) {
-            doExitPass();
-        } else {
-            doExit(strcmp(action, "exitManual") == 0, plate);
-        }
-        cls = exitGate.messageClass();
-        msg = exitGate.message();
+    const park::Gate* lane = nullptr;
+    if (strcmp(action, "entry") == 0) {
+        gates.onEntryPlate(plate);
+        lane = &gates.entryGate();
+    } else if (strcmp(action, "entryManual") == 0) {
+        gates.onEntryManual();
+        lane = &gates.entryGate();
+    } else if (strcmp(action, "entryPass") == 0) {
+        gates.onEntryPassed();
+        lane = &gates.entryGate();
+    } else if (strcmp(action, "exit") == 0) {
+        gates.onExitPlate(plate);
+        lane = &gates.exitGate();
+    } else if (strcmp(action, "exitManual") == 0) {
+        gates.onExitManual(plate);
+        lane = &gates.exitGate();
+    } else if (strcmp(action, "exitPass") == 0) {
+        gates.onExitPassed();
+        lane = &gates.exitGate();
     } else if (strcmp(action, "servoTest") == 0) {
         runServoTest();
         cls = sysCls;
         msg = sysMessage;
+    }
+    if (lane != nullptr) {
+        cls = lane->messageClass();
+        msg = lane->message();
     }
 
     char escaped[240];
@@ -625,7 +287,7 @@ void handleRoot() {
         .raw("</main></body></html>");
 }
 
-void gateJson(WebOut& out, const Gate& g, uint32_t now) {
+void gateJson(WebOut& out, const park::Gate& g, uint32_t now) {
     out.printf("{\"open\":%s,\"servo\":%s,\"left\":%lu", g.isOpen() ? "true" : "false",
                laneServoOk(g) ? "true" : "false",
                static_cast<unsigned long>((g.remainingMs(now) + 999) / 1000));
@@ -637,19 +299,19 @@ void handleState() {
     WebOut out(server);
     out.begin(200, "application/json");
     out.raw("{\"entry\":");
-    gateJson(out, entryGate, now);
+    gateJson(out, gates.entryGate(), now);
     out.raw(",\"exit\":");
-    gateJson(out, exitGate, now);
-    out.printf(",\"free\":%u,\"freeKnown\":%s,\"capacity\":%u,\"kasse\":%s", freeSpaces,
-               freeKnown ? "true" : "false", capacity, kasseOnline ? "true" : "false");
-    out.field("pending", pendingExit);
+    gateJson(out, gates.exitGate(), now);
+    out.printf(",\"free\":%u,\"freeKnown\":%s,\"capacity\":%u,\"kasse\":%s", kasse.freeSpaces(),
+               kasse.freeKnown() ? "true" : "false", kasse.capacity(), kasse.online() ? "true" : "false");
+    out.field("pending", gates.pendingExit());
     out.raw(",\"sys\":{").field("msg", sysMessage, true).field("cls", sysCls).raw("}}");
 }
 
 void handleNotFound() { sendAndClose(server, 404, "text/plain; charset=utf-8", "Nicht gefunden\n"); }
 
 // ----------------------------------------------------------------------------
-//  Hintergrundaufgaben
+//  WLAN-Verbindung zur Kasse
 // ----------------------------------------------------------------------------
 
 void startWifi() {
@@ -658,7 +320,7 @@ void startWifi() {
     WiFi.beginNoBlock(cfg::WIFI_SSID, cfg::WIFI_PASSWORD);
     lastWifiAttemptMs = millis();
     linkLostSinceMs = 0;
-    lastKasseOkMs = lastWifiAttemptMs;
+    kasse.resetLastOk(lastWifiAttemptMs);
 }
 
 // Mit statischer IP meldet WiFi.status() auch nach einem Abbruch der
@@ -682,30 +344,7 @@ bool wifiNeedsReconnect(uint32_t now) {
         return now - linkLostSinceMs >= cfg::WIFI_LINK_LOST_MS;
     }
     linkLostSinceMs = 0;
-    return now - lastKasseOkMs >= cfg::KASSE_SILENT_RECONNECT_MS;
-}
-
-void checkGateTimeouts(uint32_t now) {
-    if (entryGate.timedOut(now)) {
-        entryGate.close();
-        entryGate.setMessage("warn", "Keine Durchfahrt innerhalb von 30 s – Einfahrt geschlossen");
-    }
-    if (exitGate.timedOut(now)) {
-        char id[cfg::ID_BUF_LEN];
-        strncpy(id, exitGate.id(), sizeof(id));
-        const bool manual = exitGate.manual();
-        exitGate.close();
-        exitGate.setMessage("warn",
-                            "Keine Durchfahrt innerhalb von 30 s – Ausfahrt geschlossen, "
-                            "Fahrzeug bleibt im Parkhaus");
-        // Nur fürs Protokoll; schlägt die Meldung fehl, ändert sich am Register nichts.
-        char rid[park::ReplayCache<1, 1>::ID_LEN];
-        char body[220];
-        char resp[64];
-        newRid(rid, sizeof(rid));
-        buildBody(body, sizeof(body), id, manual, rid);
-        callKasse(proto::PATH_EXIT_ABORT, body, resp, sizeof(resp));
-    }
+    return now - kasse.lastOkMs() >= cfg::KASSE_SILENT_RECONNECT_MS;
 }
 
 }  // namespace
@@ -713,17 +352,16 @@ void checkGateTimeouts(uint32_t now) {
 void setup() {
     Serial.begin(115200);
     pinMode(LED_BUILTIN, OUTPUT);
-    digitalWrite(LED_BUILTIN, LOW);
-    bootId = rp2040.hwrand32();
+    led.set(false);
+    gates.setBootId(rp2040.hwrand32());
 
     bool allServosOk = true;
     for (uint8_t i = 0; i < cfg::SERVO_COUNT; ++i) {
-        servoOk[i] = servos[i].attach(SERVO_PINS[i], cfg::SERVO_MIN_US, cfg::SERVO_MAX_US) >= 0;
-        writeServo(i, false);
-        allServosOk = allServosOk && servoOk[i];
+        const bool ok = barriers[i].begin(SERVO_PINS[i]);
+        allServosOk = allServosOk && ok;
         Serial.printf("[Schranken] Servo %s GP%u: %s\n",
                       SHARED_BARRIER ? "Ein-/Ausfahrt (gemeinsam)" : (i == 0 ? "Einfahrt" : "Ausfahrt"),
-                      SERVO_PINS[i], servoOk[i] ? "bereit" : "FEHLER");
+                      SERVO_PINS[i], ok ? "bereit" : "FEHLER");
     }
     // Selbsttest beim Start: Schranke(n) öffnen und schliessen einmal.
     runServoTest();
@@ -748,11 +386,10 @@ void loop() {
     server.handleClient();
 
     const uint32_t now = millis();
-    checkGateTimeouts(now);
-    updateOutputs();
+    gates.checkTimeouts();
 
     if (wifiNeedsReconnect(now)) {
-        kasseOnline = false;
+        kasse.setOffline();
         if (now - lastWifiAttemptMs >= cfg::WIFI_RECONNECT_INTERVAL_MS) {
             Serial.println("[Schranken] WLAN getrennt bzw. Kasse stumm – neuer Verbindungsversuch");
             startWifi();
@@ -761,16 +398,13 @@ void loop() {
         return;
     }
     if (!wifiLinkUp()) {
-        kasseOnline = false;
+        kasse.setOffline();
         return;
     }
 
     if (now - lastStatusPollMs >= cfg::STATUS_POLL_INTERVAL_MS) {
         lastStatusPollMs = now;
-        if (pendingExit[0] != '\0' && sendExitConfirm(pendingExit, pendingExitManual, pendingRid)) {
-            Serial.printf("[Schranken] Ausfahrt %s nachgemeldet\n", pendingExit);
-            pendingExit[0] = '\0';
-        }
-        pollStatus();
+        if (gates.retryPendingExit()) Serial.println("[Schranken] Ausfahrt nachgemeldet");
+        kasse.pollStatus();
     }
 }

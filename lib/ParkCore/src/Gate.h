@@ -1,13 +1,14 @@
 #pragma once
 // Logischer Zustand einer Fahrspur (Einfahrt oder Ausfahrt): offen/zu,
-// Kennzeichen, Timeout und letzte Meldung. Welcher Servo sich dazu bewegt,
-// entscheidet main.cpp (ein gemeinsamer oder zwei getrennte Servos, siehe
-// cfg::SERVO_COUNT).
+// Kennzeichen, Timeout und letzte Meldung. Die physische Schranke dazu bewegt
+// der GateController (siehe Barrier.h).
 
-#include <Arduino.h>
+#include <stdint.h>
 #include <string.h>
 
 #include "Config.h"
+
+namespace park {
 
 class Gate {
 public:
@@ -55,3 +56,5 @@ private:
     const char* cls_ = "ok";
     char message_[160] = "";
 };
+
+}  // namespace park

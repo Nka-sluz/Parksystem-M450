@@ -10,6 +10,8 @@
 
 #include <stddef.h>
 
+#include "Kasse.h"
+
 namespace proto {
 
 // Endpunkte auf Pico 1
@@ -44,5 +46,14 @@ constexpr const char* R_ERROR = "ERROR";
 // Liest das Feld `key` aus einer "key=value"-Antwort. Liefert false, wenn das
 // Feld fehlt. Der Wert wird bei Bedarf auf outLen-1 Zeichen gekürzt.
 bool getField(const char* body, const char* key, char* out, size_t outLen);
+
+// Formularparameter einer Anfrage von Pico 2: "plate=…[&manual=1]&rid=…",
+// ohne Kennzeichen (plate == nullptr) "manual=1&rid=…". Das Kennzeichen wird
+// URL-kodiert.
+void formBody(char* out, size_t outLen, const char* plate, bool manual, const char* rid);
+
+// Liest die fachlichen Felder einer Antwort der Kasse (result, reason, id, due).
+// Liefert false, wenn das Feld result fehlt (abgebrochene Antwort).
+bool parseReply(const char* body, park::KasseReply& out);
 
 }  // namespace proto

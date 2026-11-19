@@ -17,6 +17,7 @@
 #include "EventLog.h"
 #include "Format.h"
 #include "ParkingSystem.h"
+#include "PicoClock.h"
 #include "Protocol.h"
 #include "ReplayCache.h"
 #include "WebOut.h"
@@ -26,13 +27,12 @@
 namespace {
 
 WebServer server(cfg::HTTP_PORT);
-park::ParkingSystem parking;
+PicoClock picoClock;
+park::ParkingSystem parking(picoClock);
 
 // Antworten auf wiederholte Anfragen (gleiche Request-ID) erneut ausliefern.
 park::ReplayCache<8, 192> apiReplay;  // Pico 2 → Kasse
 park::ReplayCache<4, 640> payReplay;  // Browser → Bezahlen
-
-uint32_t nowMs() { return millis(); }
 
 IPAddress toIp(const uint8_t (&a)[4]) { return IPAddress(a[0], a[1], a[2], a[3]); }
 
@@ -56,10 +56,10 @@ Text16 hms(uint32_t ms) {
     return t;
 }
 
-const char* vehicleStatus(const park::Vehicle& v, uint32_t now) {
+const char* vehicleStatus(const park::Vehicle& v) {
     if (v.state == park::VehicleState::Exited) return "ausgefahren";
     if (!v.hasPaid) return "im Parkhaus, unbezahlt";
-    if (parking.dueFor(v, now) > 0) return "im Parkhaus, Nachzahlung fällig";
+    if (parking.dueFor(v) > 0) return "im Parkhaus, Nachzahlung fällig";
     return "im Parkhaus, bezahlt";
 }
 
@@ -84,7 +84,7 @@ void pageStart(WebOut& out, const char* title, const char* refreshAction) {
                cfg::SCHRANKEN_IP[1], cfg::SCHRANKEN_IP[2], cfg::SCHRANKEN_IP[3]);
     out.raw("<span class=spacer></span><div class=head-actions>"
             "<span class=muted>Zeit seit Start: <span id=uptime>");
-    out.raw(hms(nowMs()).s);
+    out.raw(hms(picoClock.nowMs()).s);
     out.raw("</span></span><span id=link class='pill ok'>verbunden</span>");
     out.printf("<button class=secondary onclick=\"%s\">Aktualisieren</button>", refreshAction);
     out.raw("</div></header><main>");
@@ -188,7 +188,7 @@ void handleRoot() {
 }
 
 void handleUiState() {
-    const uint32_t now = nowMs();
+    const uint32_t now = picoClock.nowMs();
     char tariff[200];
     tariffText(tariff, sizeof(tariff));
 
@@ -212,8 +212,8 @@ void handleUiState() {
             out.field("id", v.id, true);
             out.printf(",\"manual\":%s", v.manual ? "true" : "false");
             out.field("entry", hms(v.entryMs).s).field("duration", hms(end - v.entryMs).s);
-            out.field("status", vehicleStatus(v, now)).field("paid", money(v.paidTotal).s);
-            out.field("due", money(parking.dueFor(v, now)).s);
+            out.field("status", vehicleStatus(v)).field("paid", money(v.paidTotal).s);
+            out.field("due", money(parking.dueFor(v)).s);
             out.raw("}");
         }
     }
@@ -242,7 +242,7 @@ void feeJson(char* out, size_t len, bool ok, const char* cls, const char* msg,
 void handleUiFee() {
     char plate[48];
     readArg(server, "plate", plate, sizeof(plate));
-    const park::FeeResult fee = parking.queryFee(plate, nowMs());
+    const park::FeeResult fee = parking.queryFee(plate);
 
     char msg[120];
     const char* cls;
@@ -274,7 +274,6 @@ void handleUiPay() {
     char amountText[24];
     readArg(server, "plate", plate, sizeof(plate));
     readArg(server, "amount", amountText, sizeof(amountText));
-    const uint32_t now = nowMs();
 
     char body[640];
     cfg::Money tendered = 0;
@@ -285,7 +284,7 @@ void handleUiPay() {
         return;
     }
 
-    const park::PaymentResult pay = parking.pay(plate, hasTendered, tendered, now);
+    const park::PaymentResult pay = parking.pay(plate, hasTendered, tendered);
     char msg[120];
     const char* cls = pay.ok ? "ok" : "err";
     if (pay.ok && pay.reason == park::Reason::NothingDue) {
@@ -299,7 +298,7 @@ void handleUiPay() {
         snprintf(msg, sizeof(msg), "Zahlung abgelehnt: %s", park::reasonMessage(pay.reason));
     }
 
-    const park::FeeResult fee = parking.queryFee(plate, now);
+    const park::FeeResult fee = parking.queryFee(plate);
     feeJson(body, sizeof(body), pay.ok, cls, msg, &fee);
     payReplay.store(rid, body);
     sendAndClose(server, 200, "application/json", body);
@@ -317,7 +316,7 @@ void handleLog() {
     out.printf("<p class=muted>%u von max. %u Einträgen · älteste zuerst · Stand %s · "
                "<a href='/log.csv'>als CSV herunterladen</a></p>",
                static_cast<unsigned>(log.size()), static_cast<unsigned>(cfg::LOG_CAPACITY),
-               hms(nowMs()).s);
+               hms(picoClock.nowMs()).s);
     if (log.overwrittenCount() > 0) {
         out.printf("<div class='msg warn'>Obergrenze erreicht: %lu ältere Einträge wurden "
                    "überschrieben (Nr. 1–%lu fehlen).</div>",
@@ -392,14 +391,13 @@ void handleApiEntry() {
     char rid[park::ReplayCache<1, 1>::ID_LEN];
     if (replayIfKnown(rid, sizeof(rid))) return;
 
-    const uint32_t now = nowMs();
     park::EntryResult r;
     if (isManualRequest()) {
-        r = parking.requestManualEntry(now);
+        r = parking.requestManualEntry();
     } else if (server.hasArg(proto::P_PLATE)) {
         char plate[48];
         readArg(server, proto::P_PLATE, plate, sizeof(plate));
-        r = parking.requestEntry(plate, now);
+        r = parking.requestEntry(plate);
     } else {
         sendApi(400, "result=ERROR\nreason=MISSING_PLATE\n");
         return;
@@ -421,7 +419,7 @@ void handleApiExitCheck() {
     }
     char plate[48];
     readArg(server, proto::P_PLATE, plate, sizeof(plate));
-    const park::ExitResult r = parking.requestExit(plate, isManualRequest(), nowMs());
+    const park::ExitResult r = parking.requestExit(plate, isManualRequest());
 
     char body[160];
     snprintf(body, sizeof(body), "%s=%s\n%s=%s\n%s=%s\n%s=%ld\n%s=%u\n", proto::F_RESULT,
@@ -440,7 +438,7 @@ void handleApiExitConfirm() {
     }
     char plate[48];
     readArg(server, proto::P_PLATE, plate, sizeof(plate));
-    const park::Reason reason = parking.confirmExit(plate, isManualRequest(), nowMs());
+    const park::Reason reason = parking.confirmExit(plate, isManualRequest());
 
     char body[128];
     snprintf(body, sizeof(body), "%s=%s\n%s=%s\n%s=%u\n", proto::F_RESULT,
@@ -458,7 +456,7 @@ void handleApiExitAbort() {
     }
     char plate[48];
     readArg(server, proto::P_PLATE, plate, sizeof(plate));
-    parking.abortExit(plate, isManualRequest(), nowMs());
+    parking.abortExit(plate, isManualRequest());
     answerApi(rid, "result=OK\n");
 }
 

@@ -29,17 +29,35 @@ where cl >nul 2>nul || goto novs
 if not exist "%OUT%" mkdir "%OUT%"
 pushd "%ROOT%"
 cl /nologo /std:c++17 /utf-8 /EHsc /W4 /D_CRT_SECURE_NO_WARNINGS /Iinclude /Ilib\ParkCore\src ^
-   test\host\parkcore_test.cpp lib\ParkCore\src\*.cpp /Fo"%OUT%\\" /Fe"%OUT%\parkcore_test.exe"
+   test\host\*.cpp lib\ParkCore\src\*.cpp /Fo"%OUT%\\" /Fe"%OUT%\parkcore_test.exe"
 if errorlevel 1 (
     popd
     echo.
     echo Build fehlgeschlagen.
     exit /b 1
 )
-popd
 echo.
 "%OUT%\parkcore_test.exe"
-exit /b %errorlevel%
+set "RESULT=%errorlevel%"
+
+rem TC-15: Kopie von Config.h mit verdoppeltem Preis pro Einheit (nur diese eine
+rem Konstante geaendert), alles neu kompilieren und die Tests erneut ausfuehren.
+set "TC15=%OUT%\tc15"
+if not exist "%TC15%\obj" mkdir "%TC15%\obj"
+powershell -NoProfile -Command "$c = Get-Content -Raw -Encoding UTF8 'include\Config.h'; $c.Replace('TARIFF_PRICE_PER_UNIT = 100;', 'TARIFF_PRICE_PER_UNIT = 200;') | Set-Content -NoNewline -Encoding UTF8 '%TC15%\Config.h'"
+echo.
+echo ===== TC-15: neu kompiliert mit TARIFF_PRICE_PER_UNIT = 200 =====
+cl /nologo /std:c++17 /utf-8 /EHsc /W4 /D_CRT_SECURE_NO_WARNINGS /DTC15_PRICE=200 /I"%TC15%" /Iinclude /Ilib\ParkCore\src ^
+   test\host\*.cpp lib\ParkCore\src\*.cpp /Fo"%TC15%\obj\\" /Fe"%TC15%\parkcore_test.exe" >nul
+if errorlevel 1 (
+    popd
+    echo Build fuer TC-15 fehlgeschlagen.
+    exit /b 1
+)
+popd
+"%TC15%\parkcore_test.exe"
+if errorlevel 1 set "RESULT=1"
+exit /b %RESULT%
 
 :novs
 echo Kein C++-Compiler gefunden. Bitte "Visual Studio Build Tools" mit der

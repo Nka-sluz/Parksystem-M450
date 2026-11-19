@@ -25,7 +25,7 @@ void logIdFor(const char* raw, PlateCheck check, const char* normalized, char* o
 
 }  // namespace
 
-ParkingSystem::ParkingSystem(const Tariff& tariff) : tariff_(tariff) {}
+ParkingSystem::ParkingSystem(const Clock& clock, const Tariff& tariff) : clock_(clock), tariff_(tariff) {}
 
 void ParkingSystem::reset() {
     memset(vehicles_, 0, sizeof(vehicles_));
@@ -84,7 +84,8 @@ void ParkingSystem::registerVehicle(Vehicle& v, const char* id, bool manual, uin
     v.entryMs = nowMs;
 }
 
-EntryResult ParkingSystem::requestEntry(const char* rawPlate, uint32_t nowMs) {
+EntryResult ParkingSystem::requestEntry(const char* rawPlate) {
+    const uint32_t nowMs = clock_.nowMs();
     EntryResult r{};
     char plate[cfg::ID_BUF_LEN];
     const PlateCheck check = normalizeId(rawPlate, plate, sizeof(plate), false);
@@ -118,7 +119,8 @@ EntryResult ParkingSystem::requestEntry(const char* rawPlate, uint32_t nowMs) {
     return r;
 }
 
-EntryResult ParkingSystem::requestManualEntry(uint32_t nowMs) {
+EntryResult ParkingSystem::requestManualEntry() {
+    const uint32_t nowMs = clock_.nowMs();
     EntryResult r{};
     if (freeSpaces() == 0) {
         r.reason = Reason::Full;
@@ -145,14 +147,15 @@ EntryResult ParkingSystem::requestManualEntry(uint32_t nowMs) {
     return r;
 }
 
-cfg::Money ParkingSystem::dueFor(const Vehicle& v, uint32_t nowMs) const {
+cfg::Money ParkingSystem::dueAt(const Vehicle& v, uint32_t nowMs) const {
     if (v.state != VehicleState::Inside) return 0;
     if (v.hasPaid && nowMs - v.paidAtMs <= cfg::PAYMENT_GRACE_MS) return 0;
     const cfg::Money due = tariff_.feeFor(nowMs - v.entryMs) - v.paidTotal;
     return due > 0 ? due : 0;
 }
 
-FeeResult ParkingSystem::queryFee(const char* rawId, uint32_t nowMs) const {
+FeeResult ParkingSystem::queryFee(const char* rawId) const {
+    const uint32_t nowMs = clock_.nowMs();
     FeeResult r{};
     char id[cfg::ID_BUF_LEN];
     if (normalizeId(rawId, id, sizeof(id), true) != PlateCheck::Ok) {
@@ -175,15 +178,15 @@ FeeResult ParkingSystem::queryFee(const char* rawId, uint32_t nowMs) const {
     r.durationMs = nowMs - v->entryMs;
     r.fee = tariff_.feeFor(r.durationMs);
     r.paid = v->paidTotal;
-    r.due = dueFor(*v, nowMs);
+    r.due = dueAt(*v, nowMs);
     const uint32_t sincePaid = nowMs - v->paidAtMs;
     r.inGrace = v->hasPaid && sincePaid <= cfg::PAYMENT_GRACE_MS;
     r.graceLeftMs = r.inGrace ? cfg::PAYMENT_GRACE_MS - sincePaid : 0;
     return r;
 }
 
-PaymentResult ParkingSystem::pay(const char* rawId, bool hasTendered, cfg::Money tendered,
-                                 uint32_t nowMs) {
+PaymentResult ParkingSystem::pay(const char* rawId, bool hasTendered, cfg::Money tendered) {
+    const uint32_t nowMs = clock_.nowMs();
     PaymentResult r{};
     char id[cfg::ID_BUF_LEN];
     if (normalizeId(rawId, id, sizeof(id), true) != PlateCheck::Ok) {
@@ -202,7 +205,7 @@ PaymentResult ParkingSystem::pay(const char* rawId, bool hasTendered, cfg::Money
         return r;
     }
 
-    const cfg::Money due = dueFor(*v, nowMs);
+    const cfg::Money due = dueAt(*v, nowMs);
     if (due == 0) {
         r.ok = true;
         r.reason = Reason::NothingDue;
@@ -236,7 +239,8 @@ PaymentResult ParkingSystem::pay(const char* rawId, bool hasTendered, cfg::Money
     return r;
 }
 
-ExitResult ParkingSystem::requestExit(const char* rawId, bool manualRequest, uint32_t nowMs) {
+ExitResult ParkingSystem::requestExit(const char* rawId, bool manualRequest) {
+    const uint32_t nowMs = clock_.nowMs();
     ExitResult r{};
     char id[cfg::ID_BUF_LEN];
     const PlateCheck check = normalizeId(rawId, id, sizeof(id), true);
@@ -250,7 +254,7 @@ ExitResult ParkingSystem::requestExit(const char* rawId, bool manualRequest, uin
     } else if (v->state == VehicleState::Exited) {
         r.reason = Reason::Exited;
     } else {
-        r.due = dueFor(*v, nowMs);
+        r.due = dueAt(*v, nowMs);
         if (r.due > 0) r.reason = Reason::Unpaid;
     }
 
@@ -264,7 +268,8 @@ ExitResult ParkingSystem::requestExit(const char* rawId, bool manualRequest, uin
     return r;
 }
 
-Reason ParkingSystem::confirmExit(const char* rawId, bool manualRequest, uint32_t nowMs) {
+Reason ParkingSystem::confirmExit(const char* rawId, bool manualRequest) {
+    const uint32_t nowMs = clock_.nowMs();
     char id[cfg::ID_BUF_LEN];
     if (normalizeId(rawId, id, sizeof(id), true) != PlateCheck::Ok) return Reason::Invalid;
 
@@ -279,7 +284,8 @@ Reason ParkingSystem::confirmExit(const char* rawId, bool manualRequest, uint32_
     return Reason::None;
 }
 
-void ParkingSystem::abortExit(const char* rawId, bool manualRequest, uint32_t nowMs) {
+void ParkingSystem::abortExit(const char* rawId, bool manualRequest) {
+    const uint32_t nowMs = clock_.nowMs();
     char id[cfg::ID_BUF_LEN];
     if (normalizeId(rawId, id, sizeof(id), true) != PlateCheck::Ok) return;
     const Vehicle* v = find(id);

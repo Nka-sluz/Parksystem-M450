@@ -17,7 +17,7 @@ in **Arduino (C++17)** mit PlatformIO.
 | Adresse | <http://192.168.42.1/> | <http://192.168.42.2/> |
 | Weboberfläche | Kasse/Zahlautomat (Gebühr anzeigen, bezahlen), Belegung, Register, Protokoll | Kamera-Simulation: Kennzeichen an Ein-/Ausfahrt eingeben, manuelle Abfertigung, Durchfahrt bestätigen |
 | Hardware | – | SG90-Servo als Schranke (GP8; optional zweiter Servo für die Ausfahrt an GP9), Onboard-LED (an = Schranke offen) |
-| Code | `src/kasse/main.cpp` | `src/schranken/main.cpp`, `src/schranken/Gate.h` |
+| Code | `src/kasse/main.cpp` + Logik `ParkingSystem` | `src/schranken/main.cpp` + Logik `GateController` |
 
 - **Entscheidungen trifft immer Pico 1.** Pico 2 meldet jedes erfasste
   Kennzeichen per HTTP an Pico 1 und öffnet die Schranke nur bei einer
@@ -34,9 +34,11 @@ in **Arduino (C++17)** mit PlatformIO.
   gesperrt und eine Ladeanzeige läuft. Beide Seiten aktualisieren sich
   automatisch (Kamera-Simulation jede Sekunde, Kasse alle 3 s) und zeigen
   den Verbindungsstatus; zusätzlich gibt es einen Button „Aktualisieren".
-- **Gemeinsame Logik** (Kennzeichenprüfung, Tarif, Register, Protokoll,
-  Protokollformat) liegt hardwareunabhängig in `lib/ParkCore/`. Die Zeit wird
-  als Parameter übergeben (`millis()` auf dem Pico).
+- **Logik ohne Hardware:** Die Logik beider Picos (Kennzeichenprüfung,
+  Tarif, Register, Protokoll, Protokollformat, Schrankensteuerung) liegt in
+  `lib/ParkCore/`. Schranke, LED, Kasse und Zeit bekommt sie über
+  Schnittstellen übergeben (siehe
+  [Automatisierte Tests mit Test Doubles](#automatisierte-tests-mit-test-doubles)).
 - **Zentrale Konfiguration** in [`include/Config.h`](include/Config.h):
   Kapazität, Tarif (Zeiteinheit, Preis, Freigrenze, Tageshöchstsatz),
   Karenzzeit, Schranken-Timeout, Protokoll-Obergrenze, WLAN und Servo-Pins.
@@ -193,7 +195,8 @@ her (keine Persistenz).
 ## Umgesetzte User Stories / Anforderungen
 
 Details und Akzeptanzkriterien: Anforderungsdokument „Anforderungen
-Parksystem"; Testfälle: „Testkonzept Parksystem" (TC-01 bis TC-41).
+Parksystem"; Testfälle: „Testkonzept Parksystem" (TC-01 bis TC-41) und die
+neuen Testfälle TC-42/TC-43 aus dem Testprotokoll (Abschnitt 6).
 
 | Story / Anforderung | Status | Umsetzung |
 |---|---|---|
@@ -213,12 +216,171 @@ Parksystem"; Testfälle: „Testkonzept Parksystem" (TC-01 bis TC-41).
 ## Tests
 
 - **Manuell (System-/Abnahmetest):** gemäss Testkonzept (TC-01 bis TC-41)
-  mit beiden Picos und der Testkonfiguration.
-- **Automatisiert (Komponententest):** `test/host/parkcore_test.cpp` prüft
-  die Logik aus `lib/ParkCore` auf dem PC anhand derselben Szenarien
-  (Kennzeichen, Tarif, Register, Bezahlung, Ausfahrt, Protokoll, manuelle
-  Abfertigung), aktuell 254 Prüfungen ohne Fehler. Anleitung:
-  [test/host/README.md](test/host/README.md).
+  mit beiden Picos und der Testkonfiguration, inkl. der Anpassungen aus dem
+  Testprotokoll (Abschnitt 6: A-01 bis A-05, neue Testfälle TC-42
+  Wiederverbindung und TC-43 Dauerbetrieb).
+- **Automatisiert (Komponententests auf dem PC):** siehe nächster Abschnitt.
+
+## Automatisierte Tests mit Test Doubles
+
+Die Logik beider Picos läuft auf dem PC und wird dort automatisch getestet,
+ohne Pico, Servo und WLAN und ohne zu warten. Dafür sind alle Abhängigkeiten
+zu Hardware und Umgebung hinter Schnittstellen versteckt und werden der Logik
+von aussen übergeben (Dependency Injection über den Konstruktor).
+
+### Aufbau
+
+```mermaid
+classDiagram
+    class GateController {
+        +GateController(Barrier, Barrier, Lamp, Kasse, Clock)
+        +onEntryPlate(plate)
+        +onEntryManual()
+        +onEntryPassed()
+        +onExitPlate(plate)
+        +onExitManual(id)
+        +onExitPassed()
+        +checkTimeouts()
+        +retryPendingExit()
+    }
+    class ParkingSystem {
+        +ParkingSystem(Clock, Tariff)
+        +requestEntry(plate)
+        +queryFee(id)
+        +pay(id, ...)
+        +requestExit(id, manual)
+    }
+    class Barrier {
+        <<interface>>
+        +open()
+        +close()
+    }
+    class Lamp {
+        <<interface>>
+        +set(on)
+    }
+    class Kasse {
+        <<interface>>
+        +requestEntry(plate, rid, reply) bool
+        +requestManualEntry(rid, reply) bool
+        +checkExit(id, manual, rid, reply) bool
+        +confirmExit(id, manual, rid) bool
+        +abortExit(id, manual, rid) bool
+    }
+    class Clock {
+        <<interface>>
+        +nowMs() uint32
+    }
+    GateController o-- Barrier
+    GateController o-- Lamp
+    GateController o-- Kasse
+    GateController o-- Clock
+    ParkingSystem o-- Clock
+    Barrier <|.. ServoBarrier
+    Barrier <|.. BarrierMock
+    Lamp <|.. LedLamp
+    Lamp <|.. LampSpy
+    Lamp <|.. LampDummy
+    Kasse <|.. HttpKasse
+    Kasse <|.. KasseStub
+    Kasse <|.. KasseFake
+    Clock <|.. PicoClock
+    Clock <|.. FakeClock
+```
+
+| | Logik (hardwareunabhängig) | echte Implementierung (Pico) | Test Double (PC) |
+|---|---|---|---|
+| Ort | `lib/ParkCore/src/` | `src/schranken/`, `include/PicoClock.h` | `test/host/TestDoubles.h` |
+| Pico 2 (Schranken) | `GateController` (Ein-/Ausfahrt, Timeout, Fail-safe, Nachmelden) | `ServoBarrier`, `LedLamp`, `HttpKasse`, `PicoClock` | `BarrierMock`, `LampSpy`, `LampDummy`, `KasseStub`, `KasseFake`, `FakeClock` |
+| Pico 1 (Kasse) | `ParkingSystem` (Register, Gebühr, Zahlung, Protokoll) | `PicoClock` | `FakeClock` |
+
+`src/schranken/main.cpp` und `src/kasse/main.cpp` erzeugen die echten
+Implementierungen, übergeben sie der Logik und verbinden sie mit der
+Weboberfläche. Hardware-Aufrufe (`Servo.write()`, `digitalWrite()`,
+`millis()`, `HTTPClient`) gibt es nur noch dort.
+
+### Abhängigkeiten und gewählte Test Doubles
+
+| Abhängigkeit | Warum nicht im automatisierten Test? | Was die Logik wirklich braucht | Schnittstelle → Test Double | Begründung |
+|---|---|---|---|---|
+| **Schranke** (Servo, `Servo.write()`) | braucht Pico und Servo; ob sie sich bewegt, sieht man nur von Auge | „öffnen" und „schliessen" | `Barrier` → **Mock** `BarrierMock` | Die Schranke liefert nichts zurück. Wichtig ist nur, *ob* und *in welcher Reihenfolge* die Logik sie ansteuert (z. B. `open,close`, bei einer Ablehnung gar nicht). Der Mock bekommt diese Erwartung vorab (`expect("open,close")`) und prüft sie mit `verify()` (Verhaltensprüfung). |
+| **LED** „Schranke offen" (`digitalWrite()`) | Hardware, nur von Auge prüfbar | an/aus | `Lamp` → **Spy** `LampSpy`, **Dummy** `LampDummy` | Spy: zeichnet Zustand und Anzahl Schaltungen auf, der Test fragt sie danach ab. Eine feste Reihenfolge wie beim Mock ist nicht nötig. Dummy: in Tests, in denen die LED keine Rolle spielt; er wird nur übergeben, weil der Konstruktor eine LED verlangt. |
+| **Zeit** (`millis()`, Ein-/Ausfahrtszeit) | Tests müssten echt warten (30 s Timeout, 2 Min. Karenzzeit, 7 Min. bis zum Höchstsatz); `millis()` lässt sich nicht steuern, Ergebnisse wären nicht wiederholbar | aktuelle Zeit in ms | `Clock` → **Fake** `FakeClock` | Eine funktionierende Uhr mit Abkürzung: Der Test stellt sie von Hand vor (`advance(30 * S)`). Ein Stub mit fester Zeit reicht nicht, weil die Abläufe eine fortschreitende Zeit brauchen (Einfahrt, nach 2 Min. Bezahlung, danach Ausfahrt). |
+| **Kommunikation zwischen den Picos** (WLAN, HTTP-Anfrage an die Kasse) | braucht zweiten Pico und WLAN; langsam (Timeouts); ein Ausfall lässt sich nicht gezielt auslösen | Antwort der Kasse (freigegeben / abgelehnt mit Grund und Betrag) oder „keine Antwort" | `Kasse` → **Stub** `KasseStub`, **Fake** `KasseFake` | Stub: liefert genau die Antwort, die ein Test braucht (z. B. „unbezahlt, CHF 3.00"), oder mit `reachable = false` keine Antwort (Fail-safe). So wird nur die Schranken-Logik geprüft. Zusätzlich merkt er sich die Request-ID der Ausfahrtsmeldung (Spy-Anteil), um das Nachmelden mit derselben ID zu prüfen. Fake: ruft direkt das echte `ParkingSystem` von Pico 1 auf. Damit laufen ganze Abläufe aus dem Testkonzept mit beiden Picos, nur ohne Netzwerk. |
+| **Kamera** bzw. ihre Simulation über die Weboberfläche | braucht Browser, WLAN und Eingaben von Hand | nur den erfassten Text des Kennzeichens | *kein Test Double nötig* | Die Weboberfläche ruft die Logik auf (`onEntryPlate(plate)`), nicht umgekehrt. Im Test übernimmt der Test selbst die Rolle der Kamera und ruft diese Methoden direkt auf. |
+| **Speicherung** der eingefahrenen Fahrzeuge (Register) und Protokoll | – | – | *kein Test Double nötig* | Register und Protokoll sind feste Arrays im RAM (keine Persistenz, gemäss Anforderungen). Sie sind schnell und deterministisch, deshalb verwenden die Tests die echte Implementierung. Würden die Daten im Flash gespeichert, wäre ein In-Memory-Fake die passende Wahl. |
+| **Tarif** (Konstanten in `Config.h`) | eine Änderung erfordert neu kompilieren und flashen | Tarifwerte | *kein Test Double, Wert-Übergabe* | `ParkingSystem` bekommt den Tarif über den Konstruktor. Für TC-15 baut `run-tests.bat` die Tests ein zweites Mal mit einer Kopie von `Config.h`, in der nur der Preis pro Einheit verdoppelt ist. |
+
+### Automatisierte Testfälle
+
+Ausführen: `.\test\host\run-tests.bat` (Windows, MSVC), Anleitung und
+g++-Variante in [test/host/README.md](test/host/README.md). Aktuell
+**383 Prüfungen, 0 Fehler**, dazu ein zweiter Build für TC-15
+(4 Prüfungen, 0 Fehler); die Tests laufen in unter einer Sekunde.
+
+| Datei | Prüft | Test Doubles |
+|---|---|---|
+| `test/host/parkcore_test.cpp` | Kassen-Logik (Pico 1): Kennzeichen, Tarif, Register, Bezahlung, Ausfahrt, Belegung, Protokoll, manuelle Abfertigung, HTTP-Protokollformat, Request-IDs | `FakeClock` |
+| `test/host/gate_controller_test.cpp` Teil 1 | Schranken-Logik (Pico 2) isoliert: Öffnen/Schliessen, Ablehnungen, Timeout, Fail-safe, Nachmelden, gemeinsame vs. getrennte Schranken | `KasseStub`, `BarrierMock`, `LampSpy`, `LampDummy`, `FakeClock` |
+| `test/host/gate_controller_test.cpp` Teil 2 | Abläufe mit beiden Picos zusammen (Pico 2 → Pico 1) | `KasseFake`, `BarrierMock`, `LampSpy`, `FakeClock` |
+
+Bezug zum Testkonzept (TC-01 bis TC-41) und zu den im Testprotokoll
+ergänzten Testfällen TC-42/TC-43 (✅ = automatisiert, ◐ = Logik
+automatisiert, ein Teil bleibt manuell, – = nur manuell):
+
+| Testkonzept | | Automatisierter Test | Was manuell bleibt |
+|---|---|---|---|
+| US1: TC-01 | ◐ | `testUs1Us2`, `testEntryOpensAndCloses`, `testScenarioParkAndPay` | Messung „innerhalb von 2 s" am echten Gerät |
+| US1: TC-02 bis TC-05 | ✅ | `testUs1Us2`, `testEntryOpensAndCloses`, `testEntryDenied`, `testEntryTimeout` (30 s mit `FakeClock`), `testScenarioParkAndPay` | – |
+| US2: TC-06 bis TC-10 | ✅ | `testUs1Us2`, `testEntryDenied`, `testScenarioFull` | – |
+| US3: TC-11 bis TC-13 | ✅ | `testTariff`, `testUs3Us4` (3:20 bzw. 7 Min. ohne Warten) | – |
+| US3: TC-14 | ◐ | `testUs3Us4` (definierte Fehlermeldung) | Schritt 2: Seite neu laden |
+| US3: TC-15 | ✅ | `testTc15`: `run-tests.bat` ändert in einer Kopie von `Config.h` nur `TARIFF_PRICE_PER_UNIT` (100 → 200), kompiliert neu und prüft CHF 6.00 nach 2 Min. 10 s | – (das Flashen gehört nicht zum Prüfziel) |
+| US4: TC-16 bis TC-21 | ✅ | `testUs3Us4` | – |
+| US5: TC-22 | ◐ | `testUs5Us6`, `testExit`, `testScenarioParkAndPay` | Messung „innerhalb von 2 s" am echten Gerät |
+| US5: TC-23 bis TC-26 | ✅ | `testUs5Us6`, `testExit`, `testExitTimeout`, `testScenarioParkAndPay`, `testScenarioExitTimeout` | – |
+| US6: TC-27 bis TC-29 | ✅ | `testUs5Us6`, `testScenarioParkAndPay`, `testScenarioFull` | – |
+| US7: TC-30 bis TC-33 | ✅ | `testUs7` (Reihenfolge, Überschreiben, gleich viele CSV-Felder) | – |
+| US8: TC-34 bis TC-37 | ✅ | `testUs8`, `testManualEntry`, `testScenarioManual` | – |
+| TC-38 Fail-safe | ◐ | `testFailSafe`, `testScenarioFailSafe`, `testPendingExitRetried` | Versuch auf dem Gerät mit `schranken-failsafe-TC38.uf2` (gemäss A-01) |
+| TC-39 Reaktionszeit | – | – | ganz manuell |
+| TC-40 Datenkonsistenz | ◐ | `testUs5Us6`, `testDoubleConfirm` (zweite Bestätigung wird abgewiesen) | zwei Browser-Tabs gleichzeitig |
+| TC-41 robuste Eingaben | ◐ | `testPlates`, `testScenarioRobustInput` (500 Zeichen, `<b>ZH</b>`) | Schritt 4: beide Oberflächen bleiben erreichbar, kein Neustart |
+| TC-42 Wiederverbindung (neu) | ◐ | `testScenarioReconnect` (Kasse weg → Einfahrt bleibt zu; Kasse zurück → Einfahrt öffnet ohne Neustart), `testPendingExitRetried` | WLAN-Wiederverbindung von Pico 2 nach dem Ausstecken von Pico 1 |
+| TC-43 Dauerbetrieb (neu) | – | – | ganz manuell: 30 Minuten Betrieb |
+
+### Fazit: Was sich nicht automatisieren lässt
+
+Die fachliche Logik ist vollständig automatisiert: Von den 43 Testfällen
+(TC-01 bis TC-43) sind 34 ganz automatisiert, bei 7 weiteren die Logik; nur
+TC-39 und TC-43 bleiben ganz manuell. Testfälle mit Wartezeit
+(TC-05, TC-11 bis TC-13, TC-18, TC-26) laufen dank `FakeClock` sofort statt in
+mehreren Minuten. Der Verbindungsausfall (TC-38) lässt sich mit dem
+`KasseStub` jederzeit gezielt auslösen. Manuell bleiben Prüfungen, die
+das echte Gerät oder die echte Umgebung brauchen:
+
+- **TC-39 Reaktionszeit** und die 2-s-Messungen in TC-01/TC-22: Die Zeit
+  hängt am echten WLAN, an der HTTP-Verbindung und am Servo. Auf dem PC mit
+  Test Doubles gäbe die Messung keine Aussage über das Gerät.
+- **TC-38 echter Verbindungsausfall**: Getestet ist, dass die Logik bei
+  „keine Antwort" die Schranke zu lässt. Ob `HttpKasse` nach den Timeouts
+  wirklich „keine Antwort" meldet, zeigt nur der Versuch mit beiden Picos
+  (Test-Firmware `schranken-failsafe-TC38.uf2`, Anpassung A-01).
+- **TC-42 Wiederverbindung**: Automatisiert ist, dass die Schranken-Logik
+  nach dem Ausfall ohne Neustart wieder normal arbeitet. Die eigentliche
+  Wiederverbindung (WLAN-Link überwachen und neu verbinden) hängt am
+  WLAN-Chip des Pico (`cyw43`) und am Access Point von Pico 1. Das lässt sich
+  nur mit beiden Geräten prüfen.
+- **TC-43 Dauerbetrieb**: Der Fehler F-01 trat erst nach ca. 15 Minuten
+  echtem Betrieb auf und lag in der WLAN-Verbindung. Eine `FakeClock` kann
+  30 Minuten zwar in Millisekunden simulieren, aber nicht das Verhalten von
+  WLAN-Treiber und Netzwerk über lange Zeit. Deshalb bleibt der Test am Gerät.
+- **Weboberfläche** (TC-14 Schritt 2, TC-40 mit zwei Tabs, TC-41 Schritt 4):
+  Anzeige, Neuladen, parallele Anfragen über den WebServer und „kein Pico
+  startet neu" brauchen Browser, WLAN und Pico.
+- **Hardware selbst**: Die Tests prüfen, dass die Logik `open()`/`close()`
+  aufruft und die LED schaltet. Ob sich der Servo dabei bewegt, bleibt eine
+  Sichtprüfung (Selbsttest beim Start bzw. „Schranken testen").
 
 ## Projektstruktur
 
@@ -227,18 +389,29 @@ include/Config.h          zentrale Konstanten (Tarif, Kapazität, Timeouts, WLAN
 include/WebOut.h          HTML-Ausgabe aus festem Puffer
 include/WebStyle.h        gemeinsames CSS
 include/WebScript.h       gemeinsames JavaScript (Wiederholungen, Ladeanzeige)
+include/PicoClock.h       echte Zeit (millis()) für beide Picos
 lib/ParkCore/src/         hardwareunabhängige Logik
+  Clock.h, Barrier.h,     Schnittstellen zu Zeit, Schranke, LED und Kasse
+  Lamp.h, Kasse.h
+  GateController.*        Logik Pico 2: Ein-/Ausfahrt, Timeout, Fail-safe
+  Gate.h                  Zustand einer Fahrspur (offen/zu, Kennzeichen, Meldung)
   Plate.*                 Kennzeichenprüfung
   Tariff.*                Gebührenberechnung
-  ParkingSystem.*         Register + Ein-/Ausfahrt/Bezahlung
+  ParkingSystem.*         Logik Pico 1: Register + Ein-/Ausfahrt/Bezahlung
   EventLog.*              Protokoll (Ringpuffer, CSV)
   Protocol.*              HTTP-Protokoll Pico 2 ↔ Pico 1
   Format.*                Beträge/Zeiten formatieren
   ReplayCache.h           Antworten zu Request-IDs (Wiederholungen ohne Doppelbuchung)
 src/kasse/main.cpp        Firmware Pico 1
 src/schranken/            Firmware Pico 2
+  main.cpp                Verdrahtung + Weboberfläche
+  PicoOutputs.h           ServoBarrier (Servo), LedLamp (LED)
+  HttpKasse.h             HTTP-Verbindung zur Kasse
 docs/HTTP-Protokoll.md    Schnittstellenbeschreibung
 test/host/                Komponententests der Logik (PC)
+  TestDoubles.h           FakeClock, BarrierMock, LampSpy, LampDummy, KasseStub, KasseFake
+  parkcore_test.cpp       Tests Pico 1 (ParkingSystem)
+  gate_controller_test.cpp  Tests Pico 2 (GateController)
 platformio.ini            Environments "kasse", "schranken" und "schranken-failsafe" (TC-38)
 build-firmware.bat        baut die Firmwares → firmware\kasse.uf2, firmware\schranken.uf2,
                           firmware\schranken-failsafe-TC38.uf2

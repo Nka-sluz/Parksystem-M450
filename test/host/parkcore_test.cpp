@@ -1,18 +1,12 @@
-// Komponententests der hardwareunabhängigen Logik (lib/ParkCore) auf dem PC.
-// Die Szenarien folgen den Testfällen des Testkonzepts (Testkonfiguration:
-// 3 Plätze, Einheit/Freigrenze 1 Min., CHF 1.00/Min., Höchstsatz CHF 5.00,
-// Karenzzeit 2 Min., Protokoll 10 Einträge).
+// Komponententests der Kassen-Logik (Pico 1) aus lib/ParkCore auf dem PC.
+// Die Zeit kommt aus einer FakeClock. Die Szenarien folgen den Testfällen des
+// Testkonzepts (Testkonfiguration: 3 Plätze, Einheit/Freigrenze 1 Min.,
+// CHF 1.00/Min., Höchstsatz CHF 5.00, Karenzzeit 2 Min., Protokoll 10 Einträge).
 //
 // Build & Run: siehe test/host/README.md
 
 #include <stdio.h>
 #include <string.h>
-
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
-#endif
 
 #include "Config.h"
 #include "EventLog.h"
@@ -22,25 +16,13 @@
 #include "Protocol.h"
 #include "ReplayCache.h"
 #include "Tariff.h"
+#include "TestDoubles.h"
+#include "TestFramework.h"
 
 static_assert(PARK_TEST_CONFIG == 1, "Tests erwarten die Testkonfiguration");
 
 namespace {
 
-int failures = 0;
-int checks = 0;
-
-#define CHECK(cond)                                                             \
-    do {                                                                        \
-        ++checks;                                                               \
-        if (!(cond)) {                                                          \
-            ++failures;                                                         \
-            printf("  FEHLER %s:%d: %s\n", __FILE__, __LINE__, #cond);          \
-        }                                                                       \
-    } while (0)
-
-constexpr uint32_t S = 1000;
-constexpr uint32_t MIN = 60 * S;
 constexpr cfg::Money TARIF = cfg::TARIFF_PRICE_PER_UNIT;
 
 using park::EventType;
@@ -57,8 +39,9 @@ const park::Vehicle* findVehicle(const ParkingSystem& p, const char* id) {
 
 const park::LogEntry& lastLog(const ParkingSystem& p) { return p.log().at(p.log().size() - 1); }
 
-void enter(ParkingSystem& p, const char* plate, uint32_t t) {
-    const auto r = p.requestEntry(plate, t);
+void enter(FakeClock& clock, ParkingSystem& p, const char* plate, uint32_t t) {
+    clock.set(t);
+    const auto r = p.requestEntry(plate);
     CHECK(r.granted);
 }
 
@@ -104,34 +87,66 @@ void testTariff() {
     CHECK(t.feeFor(2 * MIN + 10 * S) == 3 * TARIF);  // TC-15 (Basis)
     CHECK(t.feeFor(7 * MIN) == 5 * TARIF);           // TC-13 Höchstsatz
     CHECK(t.feeFor(cfg::TARIFF_DAY_MS + 1 * MIN) == cfg::TARIFF_DAILY_MAX + 1 * TARIF);
+
+    // Der Tarif lässt sich auch über den Konstruktor übergeben.
+    FakeClock clock;
+    park::Tariff doubled = park::Tariff::fromConfig();
+    doubled.pricePerUnit *= 2;
+    doubled.dailyMax *= 2;
+    ParkingSystem p(clock, doubled);
+    enter(clock, p, "ZH-100001", 0);
+    clock.set(2 * MIN + 10 * S);
+    CHECK(p.queryFee("ZH-100001").fee == 3 * 2 * TARIF);
 }
+
+#ifdef TC15_PRICE
+// TC-15 (Konfigurierbarkeit): run-tests.bat baut die Tests ein zweites Mal mit
+// einer Kopie von Config.h, in der nur TARIFF_PRICE_PER_UNIT verdoppelt ist.
+// Die Gebühr nach 2 Min. 10 s muss 3 × neuer Tarif sein (CHF 6.00), der
+// Höchstsatz folgt ohne weitere Änderung.
+void testTc15() {
+    puts("TC-15 Konfigurierbarkeit: neu kompiliert mit verdoppelter Konstante");
+    CHECK(cfg::TARIFF_PRICE_PER_UNIT == TC15_PRICE);
+    CHECK(cfg::TARIFF_DAILY_MAX == 5 * TC15_PRICE);
+    FakeClock clock;
+    ParkingSystem p(clock);  // Tarif aus Config.h
+    enter(clock, p, "ZH-100001", 0);
+    clock.set(2 * MIN + 10 * S);
+    CHECK(p.queryFee("ZH-100001").fee == 3 * TC15_PRICE);
+}
+#endif
 
 void testUs1Us2() {
     puts("US1/US2 Einfahrt (TC-01..TC-10)");
-    ParkingSystem p;
-    auto r = p.requestEntry("ZH-100001", 1 * S);  // TC-01
+    FakeClock clock;
+    ParkingSystem p(clock);
+    clock.set(1 * S);
+    auto r = p.requestEntry("ZH-100001");  // TC-01
     CHECK(r.granted && strcmp(r.id, "ZH-100001") == 0);
     const park::Vehicle* v = findVehicle(p, "ZH-100001");  // TC-02
     CHECK(v != nullptr && v->state == park::VehicleState::Inside && !v->hasPaid && v->entryMs == 1 * S);
     CHECK(p.freeSpaces() == 2);
     CHECK(lastLog(p).type == EventType::Entry);
 
-    r = p.requestEntry("ZH-100001", 2 * S);  // TC-03
+    clock.set(2 * S);
+    r = p.requestEntry("ZH-100001");  // TC-03
     CHECK(!r.granted && r.reason == Reason::Duplicate);
     CHECK(p.freeSpaces() == 2);
 
     // Grundzustand für US2
     p.reset();
-    CHECK(p.requestEntry("", 1 * S).reason == Reason::Invalid);                // TC-06
-    CHECK(p.requestEntry("ZH-!!??", 2 * S).reason == Reason::Invalid);         // TC-07
-    CHECK(p.requestEntry("ZH-12345678901", 3 * S).reason == Reason::Invalid);  // TC-07
-    enter(p, "ZH-100001", 4 * S);
-    enter(p, "ZH-100002", 5 * S);
-    enter(p, "ZH-100003", 6 * S);
+    clock.set(1 * S);
+    CHECK(p.requestEntry("").reason == Reason::Invalid);                // TC-06
+    CHECK(p.requestEntry("ZH-!!??").reason == Reason::Invalid);         // TC-07
+    CHECK(p.requestEntry("ZH-12345678901").reason == Reason::Invalid);  // TC-07
+    enter(clock, p, "ZH-100001", 4 * S);
+    enter(clock, p, "ZH-100002", 5 * S);
+    enter(clock, p, "ZH-100003", 6 * S);
     CHECK(p.freeSpaces() == 0);
-    CHECK(p.requestEntry("ZH-100004", 7 * S).reason == Reason::Full);  // TC-08
-    CHECK(p.requestManualEntry(8 * S).reason == Reason::Full);         // TC-09
-    CHECK(findVehicle(p, "ZH-100004") == nullptr);                     // TC-10
+    clock.set(7 * S);
+    CHECK(p.requestEntry("ZH-100004").reason == Reason::Full);  // TC-08
+    CHECK(p.requestManualEntry().reason == Reason::Full);       // TC-09
+    CHECK(findVehicle(p, "ZH-100004") == nullptr);              // TC-10
     CHECK(findVehicle(p, "MANUAL-1") == nullptr);
     CHECK(p.freeSpaces() == 0);
 
@@ -144,109 +159,138 @@ void testUs1Us2() {
 
 void testUs3Us4() {
     puts("US3/US4 Gebühr & Bezahlung (TC-11..TC-21)");
-    ParkingSystem p;
-    enter(p, "ZH-100001", 0);
-    auto fee = p.queryFee("ZH-100001", 3 * MIN + 20 * S);  // TC-11
+    FakeClock clock;
+    ParkingSystem p(clock);
+    enter(clock, p, "ZH-100001", 0);
+    clock.set(3 * MIN + 20 * S);
+    auto fee = p.queryFee("ZH-100001");  // TC-11
     CHECK(fee.ok && fee.fee == 4 * TARIF && fee.due == 4 * TARIF);
 
-    enter(p, "ZH-100002", 4 * MIN);
-    CHECK(p.queryFee("ZH-100002", 4 * MIN + 25 * S).due == 0);  // TC-12
-    CHECK(p.queryFee("ZH-100001", 7 * MIN).fee == 5 * TARIF);   // TC-13
+    enter(clock, p, "ZH-100002", 4 * MIN);
+    clock.set(4 * MIN + 25 * S);
+    CHECK(p.queryFee("ZH-100002").due == 0);  // TC-12
+    clock.set(7 * MIN);
+    CHECK(p.queryFee("ZH-100001").fee == 5 * TARIF);  // TC-13
 
-    fee = p.queryFee("XX-999999", 7 * MIN);  // TC-14
+    fee = p.queryFee("XX-999999");  // TC-14
     CHECK(!fee.ok && fee.reason == Reason::Unknown);
 
     // TC-16..18
     p.reset();
-    enter(p, "ZH-100001", 0);
-    auto pay = p.pay("ZH-100001", false, 0, 2 * MIN + 10 * S);
+    enter(clock, p, "ZH-100001", 0);
+    clock.set(2 * MIN + 10 * S);
+    auto pay = p.pay("ZH-100001", false, 0);
     CHECK(pay.ok && pay.amount == 3 * TARIF);
-    fee = p.queryFee("ZH-100001", 2 * MIN + 11 * S);
+    clock.set(2 * MIN + 11 * S);
+    fee = p.queryFee("ZH-100001");
     CHECK(fee.due == 0 && fee.inGrace);
     const park::LogEntry& e = lastLog(p);  // TC-17
     CHECK(e.type == EventType::Payment && e.hasAmount && e.amount == 3 * TARIF);
     CHECK(strcmp(e.id, "ZH-100001") == 0);
     // innerhalb der Karenzzeit: Ausfahrt frei
-    CHECK(p.requestExit("ZH-100001", false, 4 * MIN).open);
+    clock.set(4 * MIN);
+    CHECK(p.requestExit("ZH-100001", false).open);
     // TC-18: 3 Min. später (Karenzzeit 2 Min. abgelaufen) → Nachzahlung
-    fee = p.queryFee("ZH-100001", 5 * MIN + 10 * S);
+    clock.set(5 * MIN + 10 * S);
+    fee = p.queryFee("ZH-100001");
     CHECK(fee.due == 5 * TARIF - 3 * TARIF);
-    auto ex = p.requestExit("ZH-100001", false, 5 * MIN + 10 * S);
+    auto ex = p.requestExit("ZH-100001", false);
     CHECK(!ex.open && ex.reason == Reason::Unpaid && ex.due == 2 * TARIF);
     // Nachzahlung
-    pay = p.pay("ZH-100001", false, 0, 5 * MIN + 20 * S);
+    clock.set(5 * MIN + 20 * S);
+    pay = p.pay("ZH-100001", false, 0);
     CHECK(pay.ok && pay.amount == 2 * TARIF);
     CHECK(p.revenue() == 5 * TARIF);
 
     // Betrag nicht ausreichend / Rückgeld
-    enter(p, "ZH-100005", 6 * MIN);
-    pay = p.pay("ZH-100005", true, 100, 8 * MIN + 30 * S);  // fällig 3.00
+    enter(clock, p, "ZH-100005", 6 * MIN);
+    clock.set(8 * MIN + 30 * S);
+    pay = p.pay("ZH-100005", true, 100);  // fällig 3.00
     CHECK(!pay.ok && pay.reason == Reason::Insufficient && pay.amount == 3 * TARIF);
-    pay = p.pay("ZH-100005", true, 500, 8 * MIN + 30 * S);
+    pay = p.pay("ZH-100005", true, 500);
     CHECK(pay.ok && pay.amount == 3 * TARIF && pay.change == 200);
 
-    CHECK(p.pay("XX-999999", false, 0, 9 * MIN).reason == Reason::Unknown);  // TC-19
+    clock.set(9 * MIN);
+    CHECK(p.pay("XX-999999", false, 0).reason == Reason::Unknown);  // TC-19
 
     // TC-20
-    enter(p, "ZH-100002", 9 * MIN);
-    CHECK(p.requestExit("ZH-100002", false, 9 * MIN + 10 * S).open);  // Freigrenze
-    CHECK(p.confirmExit("ZH-100002", false, 9 * MIN + 12 * S) == Reason::None);
-    pay = p.pay("ZH-100002", false, 0, 9 * MIN + 20 * S);
+    enter(clock, p, "ZH-100002", 9 * MIN);
+    clock.set(9 * MIN + 10 * S);
+    CHECK(p.requestExit("ZH-100002", false).open);  // Freigrenze
+    clock.set(9 * MIN + 12 * S);
+    CHECK(p.confirmExit("ZH-100002", false) == Reason::None);
+    clock.set(9 * MIN + 20 * S);
+    pay = p.pay("ZH-100002", false, 0);
     CHECK(!pay.ok && pay.reason == Reason::Exited);
 
     // TC-21
-    enter(p, "ZH-100003", 10 * MIN);
-    pay = p.pay("ZH-100003", false, 0, 10 * MIN + 20 * S);
+    enter(clock, p, "ZH-100003", 10 * MIN);
+    clock.set(10 * MIN + 20 * S);
+    pay = p.pay("ZH-100003", false, 0);
     CHECK(pay.ok && pay.reason == Reason::NothingDue);
     const park::Vehicle* v = findVehicle(p, "ZH-100003");
-    CHECK(v != nullptr && v->hasPaid && p.dueFor(*v, 10 * MIN + 21 * S) == 0);
+    clock.set(10 * MIN + 21 * S);
+    CHECK(v != nullptr && v->hasPaid && p.dueFor(*v) == 0);
     // erneutes Bezahlen verlängert die Karenzzeit nicht
     const size_t logSize = p.log().size();
-    p.pay("ZH-100003", false, 0, 11 * MIN);
+    clock.set(11 * MIN);
+    p.pay("ZH-100003", false, 0);
     CHECK(p.log().size() == logSize);
     CHECK(findVehicle(p, "ZH-100003")->paidAtMs == 10 * MIN + 20 * S);
 }
 
 void testUs5Us6() {
     puts("US5/US6 Ausfahrt & Belegung (TC-22..TC-29, TC-40)");
-    ParkingSystem p;
+    FakeClock clock;
+    ParkingSystem p(clock);
     CHECK(p.capacity() == 3 && p.occupied() == 0 && p.freeSpaces() == 3);  // TC-27
-    enter(p, "ZH-100001", 0);
-    p.pay("ZH-100001", false, 0, 2 * MIN);
-    CHECK(p.requestExit("ZH-100001", false, 2 * MIN + 5 * S).open);  // TC-22
-    CHECK(p.confirmExit("ZH-100001", false, 2 * MIN + 8 * S) == Reason::None);  // TC-23
+    enter(clock, p, "ZH-100001", 0);
+    clock.set(2 * MIN);
+    p.pay("ZH-100001", false, 0);
+    clock.set(2 * MIN + 5 * S);
+    CHECK(p.requestExit("ZH-100001", false).open);  // TC-22
+    clock.set(2 * MIN + 8 * S);
+    CHECK(p.confirmExit("ZH-100001", false) == Reason::None);  // TC-23
     CHECK(findVehicle(p, "ZH-100001")->state == park::VehicleState::Exited);
     CHECK(p.freeSpaces() == 3);
     // TC-40: zweite Bestätigung ändert nichts
-    CHECK(p.confirmExit("ZH-100001", false, 2 * MIN + 9 * S) == Reason::Exited);
+    clock.set(2 * MIN + 9 * S);
+    CHECK(p.confirmExit("ZH-100001", false) == Reason::Exited);
     CHECK(p.freeSpaces() == 3);
 
-    enter(p, "ZH-100002", 3 * MIN);  // TC-24
-    auto ex = p.requestExit("ZH-100002", false, 5 * MIN + 10 * S);
+    enter(clock, p, "ZH-100002", 3 * MIN);  // TC-24
+    clock.set(5 * MIN + 10 * S);
+    auto ex = p.requestExit("ZH-100002", false);
     CHECK(!ex.open && ex.reason == Reason::Unpaid);
-    CHECK(ex.due == p.queryFee("ZH-100002", 5 * MIN + 10 * S).due);
+    CHECK(ex.due == p.queryFee("ZH-100002").due);
 
-    ex = p.requestExit("XX-999999", false, 6 * MIN);  // TC-25
+    clock.set(6 * MIN);
+    ex = p.requestExit("XX-999999", false);  // TC-25
     CHECK(!ex.open && ex.reason == Reason::Unknown);
 
-    enter(p, "ZH-100003", 6 * MIN);  // TC-26
-    p.pay("ZH-100003", false, 0, 6 * MIN + 10 * S);
-    CHECK(p.requestExit("ZH-100003", false, 6 * MIN + 20 * S).open);
-    p.abortExit("ZH-100003", false, 6 * MIN + 50 * S);
+    enter(clock, p, "ZH-100003", 6 * MIN);  // TC-26
+    clock.set(6 * MIN + 10 * S);
+    p.pay("ZH-100003", false, 0);
+    clock.set(6 * MIN + 20 * S);
+    CHECK(p.requestExit("ZH-100003", false).open);
+    clock.set(6 * MIN + 50 * S);
+    p.abortExit("ZH-100003", false);
     CHECK(findVehicle(p, "ZH-100003")->state == park::VehicleState::Inside);
     CHECK(lastLog(p).type == EventType::ExitAborted);
 
     // TC-29: Grenzwert
-    enter(p, "ZH-100004", 7 * MIN);
+    enter(clock, p, "ZH-100004", 7 * MIN);
     CHECK(p.freeSpaces() == 0);
-    CHECK(p.requestEntry("ZH-100001", 7 * MIN + 5 * S).reason == Reason::Full);
+    clock.set(7 * MIN + 5 * S);
+    CHECK(p.requestEntry("ZH-100001").reason == Reason::Full);
     CHECK(p.freeSpaces() == 0 && p.occupied() == 3);
 
     // Wiedereinfahrt eines ausgefahrenen Kennzeichens nutzt denselben Eintrag
     p.reset();
-    enter(p, "ZH-100001", 0);
-    p.confirmExit("ZH-100001", false, 10 * S);
-    enter(p, "ZH-100001", 20 * S);
+    enter(clock, p, "ZH-100001", 0);
+    clock.set(10 * S);
+    p.confirmExit("ZH-100001", false);
+    enter(clock, p, "ZH-100001", 20 * S);
     int count = 0;
     for (size_t i = 0; i < p.registerSize(); ++i) {
         if (p.vehicleAt(i).used && strcmp(p.vehicleAt(i).id, "ZH-100001") == 0) ++count;
@@ -259,21 +303,28 @@ void testUs5Us6() {
     char plate[16];
     for (int i = 0; i < 40; ++i) {
         snprintf(plate, sizeof(plate), "ZH-%d", 200 + i);
-        enter(p, plate, i * S);
-        CHECK(p.confirmExit(plate, false, i * S + 500) == Reason::None);
+        enter(clock, p, plate, i * S);
+        clock.set(i * S + 500);
+        CHECK(p.confirmExit(plate, false) == Reason::None);
     }
     CHECK(p.freeSpaces() == 3);
 }
 
 void testUs7() {
     puts("US7 Protokoll (TC-30..TC-33)");
-    ParkingSystem p;
-    enter(p, "ZH-100001", 0);                                   // 1
-    p.requestEntry("ZH-!!??", 5 * S);                           // 2
-    p.requestExit("ZH-100001", false, 2 * MIN + 5 * S);         // 3 (unbezahlt)
-    p.pay("ZH-100001", false, 0, 2 * MIN + 30 * S);             // 4
-    CHECK(p.requestExit("ZH-100001", false, 2 * MIN + 40 * S).open);
-    p.confirmExit("ZH-100001", false, 2 * MIN + 45 * S);        // 5
+    FakeClock clock;
+    ParkingSystem p(clock);
+    enter(clock, p, "ZH-100001", 0);  // 1
+    clock.set(5 * S);
+    p.requestEntry("ZH-!!??");  // 2
+    clock.set(2 * MIN + 5 * S);
+    p.requestExit("ZH-100001", false);  // 3 (unbezahlt)
+    clock.set(2 * MIN + 30 * S);
+    p.pay("ZH-100001", false, 0);  // 4
+    clock.set(2 * MIN + 40 * S);
+    CHECK(p.requestExit("ZH-100001", false).open);
+    clock.set(2 * MIN + 45 * S);
+    p.confirmExit("ZH-100001", false);  // 5
     const park::EventLog& log = p.log();
     CHECK(log.size() == 5);  // TC-30
     CHECK(log.at(0).type == EventType::Entry);
@@ -289,10 +340,13 @@ void testUs7() {
 
     // TC-32: Überschreiben
     p.reset();
-    for (int i = 0; i < 10; ++i) p.requestEntry("ZH-!!??", i * S);
+    for (int i = 0; i < 10; ++i) {
+        clock.set(i * S);
+        p.requestEntry("ZH-!!??");
+    }
     CHECK(p.log().size() == 10 && p.log().overwrittenCount() == 0);
     const uint32_t firstSeq = p.log().at(0).seq;
-    enter(p, "ZH-100001", 20 * S);
+    enter(clock, p, "ZH-100001", 20 * S);
     CHECK(p.log().size() == 10 && p.log().overwrittenCount() == 1);
     CHECK(p.log().at(0).seq == firstSeq + 1);
     CHECK(lastLog(p).type == EventType::Entry);
@@ -316,21 +370,27 @@ void testUs7() {
 
 void testUs8() {
     puts("US8 Manuelle Abfertigung (TC-34..TC-37)");
-    ParkingSystem p;
-    auto r = p.requestManualEntry(0);  // TC-34
+    FakeClock clock;
+    ParkingSystem p(clock);
+    auto r = p.requestManualEntry();  // TC-34
     CHECK(r.granted && strcmp(r.id, "MANUAL-1") == 0);
     CHECK(findVehicle(p, "MANUAL-1") != nullptr);
-    enter(p, "ZH-100001", 1 * S);
-    enter(p, "ZH-100002", 2 * S);
-    r = p.requestManualEntry(3 * S);  // TC-35
+    enter(clock, p, "ZH-100001", 1 * S);
+    enter(clock, p, "ZH-100002", 2 * S);
+    clock.set(3 * S);
+    r = p.requestManualEntry();  // TC-35
     CHECK(!r.granted && r.reason == Reason::Full);
     CHECK(findVehicle(p, "MANUAL-2") == nullptr);
 
-    auto ex = p.requestExit("MANUAL-1", true, 2 * MIN + 5 * S);  // TC-36
+    clock.set(2 * MIN + 5 * S);
+    auto ex = p.requestExit("MANUAL-1", true);  // TC-36
     CHECK(!ex.open && ex.reason == Reason::Unpaid && ex.due == 3 * TARIF);
-    CHECK(p.pay("MANUAL-1", false, 0, 2 * MIN + 20 * S).ok);
-    CHECK(p.requestExit("MANUAL-1", true, 2 * MIN + 30 * S).open);
-    CHECK(p.confirmExit("MANUAL-1", true, 2 * MIN + 35 * S) == Reason::None);
+    clock.set(2 * MIN + 20 * S);
+    CHECK(p.pay("MANUAL-1", false, 0).ok);
+    clock.set(2 * MIN + 30 * S);
+    CHECK(p.requestExit("MANUAL-1", true).open);
+    clock.set(2 * MIN + 35 * S);
+    CHECK(p.confirmExit("MANUAL-1", true) == Reason::None);
     CHECK(findVehicle(p, "MANUAL-1")->state == park::VehicleState::Exited);
 
     bool entryManual = false;  // TC-37
@@ -344,7 +404,8 @@ void testUs8() {
     CHECK(entryManual && exitManual);
 
     // Nach Ausfahrt ist wieder Platz – nächste Ersatz-ID ist MANUAL-2
-    r = p.requestManualEntry(3 * MIN);
+    clock.set(3 * MIN);
+    r = p.requestManualEntry();
     CHECK(r.granted && strcmp(r.id, "MANUAL-2") == 0);
 }
 
@@ -374,6 +435,27 @@ void testHelpers() {
     CHECK(!proto::getField(body, "fre", buf, sizeof(buf)));
     CHECK(!proto::getField(body, "missing", buf, sizeof(buf)));
     CHECK(park::reasonFromToken(park::reasonToken(Reason::Unpaid)) == Reason::Unpaid);
+
+    // Anfragen von Pico 2 an die Kasse (Formularparameter, URL-kodiert)
+    char form[96];
+    proto::formBody(form, sizeof(form), "ZH 1/ä", false, "p2-1");
+    CHECK_STR(form, "plate=ZH%201%2F%C3%A4&rid=p2-1");
+    proto::formBody(form, sizeof(form), "MANUAL-1", true, "p2-2");
+    CHECK_STR(form, "plate=MANUAL-1&manual=1&rid=p2-2");
+    proto::formBody(form, sizeof(form), nullptr, false, "p2-3");
+    CHECK_STR(form, "manual=1&rid=p2-3");
+
+    // Antworten der Kasse lesen
+    park::KasseReply reply;
+    CHECK(proto::parseReply(body, reply));
+    CHECK(!reply.accepted && reply.reason == Reason::Unpaid && reply.due == 300);
+    CHECK_STR(reply.id, "ZH-100002");
+    CHECK(proto::parseReply("result=OPEN\nreason=NONE\nid=ZH-100001\ndue=0\nfree=2\n", reply));
+    CHECK(reply.accepted && reply.reason == Reason::None);
+    CHECK(proto::parseReply("result=GRANTED\nreason=NONE\nid=MANUAL-1\nfree=2\n", reply));
+    CHECK(reply.accepted);
+    CHECK_STR(reply.id, "MANUAL-1");
+    CHECK(!proto::parseReply("reason=NONE\nid=ZH-1\n", reply));  // abgebrochen: ohne result
 }
 
 void testReplay() {
@@ -392,12 +474,14 @@ void testReplay() {
 
     // Szenario: Antwort der Kasse geht verloren, Pico 2 wiederholt die Einfahrt
     // mit derselben ID → gleiche Antwort, keine "bereits eingefahren"-Ablehnung.
-    ParkingSystem p;
+    FakeClock clock;
+    ParkingSystem p(clock);
     park::ReplayCache<8, 192> api;
     auto handleEntry = [&](const char* rid, const char* plate, uint32_t t) -> const char* {
         if (const char* cached = api.find(rid)) return cached;
         static char body[192];
-        const auto r = p.requestEntry(plate, t);
+        clock.set(t);
+        const auto r = p.requestEntry(plate);
         snprintf(body, sizeof(body), "result=%s\nreason=%s\n", r.granted ? "GRANTED" : "DENIED",
                  park::reasonToken(r.reason));
         api.store(rid, body);
@@ -419,11 +503,7 @@ void testReplay() {
 
 }  // namespace
 
-int main() {
-#ifdef _WIN32
-    // Ausgaben sind UTF-8 (Umlaute); die Windows-Konsole erwartet sonst CP850.
-    SetConsoleOutputCP(CP_UTF8);
-#endif
+void runParkCoreTests() {
     testPlates();
     testTariff();
     testUs1Us2();
@@ -433,6 +513,8 @@ int main() {
     testUs8();
     testHelpers();
     testReplay();
-    printf("\n%d Prüfungen, %d Fehler\n", checks, failures);
-    return failures == 0 ? 0 : 1;
 }
+
+#ifdef TC15_PRICE
+void runTc15Test() { testTc15(); }
+#endif

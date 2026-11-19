@@ -1,13 +1,15 @@
 #pragma once
 // Fahrzeugregister und Geschäftslogik der Leitstelle (läuft auf Pico 1 "Kasse").
 //
-// Die Klasse ist hardwareunabhängig: Die aktuelle Zeit wird als Parameter
-// (Millisekunden seit Start) übergeben. Es wird kein dynamischer Speicher
-// verwendet; Register und Protokoll haben feste Obergrenzen (Config.h).
+// Die Klasse ist hardwareunabhängig: Die Zeitquelle (Clock) wird über den
+// Konstruktor übergeben – auf dem Pico millis(), im Test eine FakeClock. Es wird
+// kein dynamischer Speicher verwendet; Register und Protokoll haben feste
+// Obergrenzen (Config.h).
 
 #include <stddef.h>
 #include <stdint.h>
 
+#include "Clock.h"
 #include "Config.h"
 #include "EventLog.h"
 #include "Tariff.h"
@@ -63,28 +65,28 @@ struct ExitResult {
 
 class ParkingSystem {
 public:
-    explicit ParkingSystem(const Tariff& tariff = Tariff::fromConfig());
+    explicit ParkingSystem(const Clock& clock, const Tariff& tariff = Tariff::fromConfig());
 
     void reset();
 
     // US1/US2: automatische Einfahrt per Kennzeichen.
-    EntryResult requestEntry(const char* rawPlate, uint32_t nowMs);
+    EntryResult requestEntry(const char* rawPlate);
     // US8: manuelle Einfahrt, vergibt MANUAL-<n>.
-    EntryResult requestManualEntry(uint32_t nowMs);
+    EntryResult requestManualEntry();
 
     // US3: Gebühr abfragen (verändert nichts).
-    FeeResult queryFee(const char* rawId, uint32_t nowMs) const;
+    FeeResult queryFee(const char* rawId) const;
 
     // US4: Bezahlen. Ohne `hasTendered` wird genau der offene Betrag bezahlt.
-    PaymentResult pay(const char* rawId, bool hasTendered, cfg::Money tendered, uint32_t nowMs);
+    PaymentResult pay(const char* rawId, bool hasTendered, cfg::Money tendered);
 
     // US5: Ausfahrt anfragen. Gibt frei, wenn der offene Betrag 0 ist.
     // Verweigerungen werden protokolliert, die Freigabe erst bei confirmExit.
-    ExitResult requestExit(const char* rawId, bool manualRequest, uint32_t nowMs);
+    ExitResult requestExit(const char* rawId, bool manualRequest);
     // Durchfahrt bestätigt → Status "ausgefahren", Platz frei. Reason::None = ok.
-    Reason confirmExit(const char* rawId, bool manualRequest, uint32_t nowMs);
+    Reason confirmExit(const char* rawId, bool manualRequest);
     // Freigegebene Ausfahrt ohne Durchfahrt (Timeout) – nur Protokolleintrag.
-    void abortExit(const char* rawId, bool manualRequest, uint32_t nowMs);
+    void abortExit(const char* rawId, bool manualRequest);
 
     // US6: Belegung.
     uint16_t capacity() const { return cfg::CAPACITY; }
@@ -96,7 +98,7 @@ public:
     // Register für die Anzeige.
     size_t registerSize() const { return cfg::REGISTER_SIZE; }
     const Vehicle& vehicleAt(size_t i) const { return vehicles_[i]; }
-    cfg::Money dueFor(const Vehicle& v, uint32_t nowMs) const;
+    cfg::Money dueFor(const Vehicle& v) const { return dueAt(v, clock_.nowMs()); }
 
     const EventLog& log() const { return log_; }
     const Tariff& tariff() const { return tariff_; }
@@ -106,7 +108,9 @@ private:
     const Vehicle* find(const char* id) const;
     Vehicle* allocate(const char* id);
     void registerVehicle(Vehicle& v, const char* id, bool manual, uint32_t nowMs);
+    cfg::Money dueAt(const Vehicle& v, uint32_t nowMs) const;
 
+    const Clock& clock_;
     Tariff tariff_;
     Vehicle vehicles_[cfg::REGISTER_SIZE] = {};
     EventLog log_;
